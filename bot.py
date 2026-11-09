@@ -307,6 +307,14 @@ async def update_board(bot, chat_id, game):
                 return
     m = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML)
     game["board_msg_id"] = m.message_id
+    try:  # закрепляем список строк, дальше он только дополняется
+        await bot.pin_chat_message(chat_id, m.message_id, disable_notification=True)
+    except Exception as e:
+        log.warning("не удалось закрепить список строк: %s", e)
+        await bot.send_message(
+            chat_id,
+            "⚠️ Не смог закрепить список строк. Дайте боту право «Закреплять сообщения».",
+        )
 
 
 def is_bot_admin(user) -> bool:
@@ -572,6 +580,11 @@ async def cmd_stopgame(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.edit_message_reply_markup(chat_id, game["msg_id"], reply_markup=None)
     except BadRequest:
         pass
+    if game.get("board_msg_id"):  # открепляем список строк
+        try:
+            await context.bot.unpin_chat_message(chat_id, game["board_msg_id"])
+        except Exception as e:
+            log.warning("не удалось открепить: %s", e)
     await update.effective_message.reply_text(
         "🛑 Игра завершена. Бот не реагирует на сообщения, пока не запущена новая игра."
     )
