@@ -43,6 +43,10 @@ PING_INTERVAL = 600  # секунд
 allowed_chats: dict[int, str] = {}
 # постоянные топы (/top): ключ игрока -> подпись
 perm_tops: dict[str, str] = {}
+# должники: номер долга -> {"key", "label", "title"}
+debts: dict[int, dict] = {}
+# чёрный список: ключ игрока -> {"label", "reason"}
+blacklist: dict[str, dict] = {}
 # chat_id -> состояние игры
 games: dict[int, dict] = {}
 # (chat_id, user_id): человек нажал «Записаться» и сейчас должен прислать числа в чат
@@ -73,6 +77,8 @@ def load_file():
             d = json.load(f)
         allowed_chats.update({int(k): v for k, v in d.get("chats", {}).items()})
         perm_tops.update(d.get("tops", {}))
+        debts.update({int(k): v for k, v in d.get("debts", {}).items()})
+        blacklist.update(d.get("black", {}))
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -83,7 +89,12 @@ def save_file():
     try:
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(
-                {"chats": {str(k): v for k, v in allowed_chats.items()}, "tops": perm_tops},
+                {
+                    "chats": {str(k): v for k, v in allowed_chats.items()},
+                    "tops": perm_tops,
+                    "debts": {str(k): v for k, v in debts.items()},
+                    "black": blacklist,
+                },
                 f,
                 ensure_ascii=False,
             )
@@ -107,13 +118,26 @@ async def init_storage():
                 "CREATE TABLE IF NOT EXISTS chats ("
                 " chat_id BIGINT PRIMARY KEY, title TEXT NOT NULL DEFAULT '');"
                 "CREATE TABLE IF NOT EXISTS tops ("
-                " user_key TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '')"
+                " user_key TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '');"
+                "CREATE TABLE IF NOT EXISTS debts ("
+                " id BIGSERIAL PRIMARY KEY, user_key TEXT NOT NULL, label TEXT NOT NULL DEFAULT '',"
+                " title TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());"
+                "CREATE TABLE IF NOT EXISTS blacklist ("
+                " user_key TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '',"
+                " reason TEXT NOT NULL DEFAULT '')"
             )
             for r in await c.fetch("SELECT chat_id, title FROM chats"):
                 allowed_chats[r["chat_id"]] = r["title"]
             for r in await c.fetch("SELECT user_key, label FROM tops"):
                 perm_tops[r["user_key"]] = r["label"]
-        log.info("База подключена: чатов %d, топов %d", len(allowed_chats), len(perm_tops))
+            for r in await c.fetch("SELECT id, user_key, label, title FROM debts ORDER BY id"):
+                debts[r["id"]] = {"key": r["user_key"], "label": r["label"], "title": r["title"]}
+            for r in await c.fetch("SELECT user_key, label, reason FROM blacklist"):
+                blacklist[r["user_key"]] = {"label": r["label"], "reason": r["reason"]}
+        log.info(
+            "База подключена: чатов %d, топов %d, долгов %d, в черном списке %d",
+            len(allowed_chats), len(perm_tops), len(debts), len(blacklist),
+        )
     else:
         log.warning(
             "DATABASE_URL не задан — данные хранятся в файле %s и пропадут при деплое на бесплатном Render",
@@ -174,6 +198,60 @@ async def storage_del_top(key: str) -> bool:
     return await db_exec("DELETE FROM tops WHERE user_key = $1", key)
 
 
+async def db_fetchrow(query: str, *args):
+    """Запись с возвратом строки (INSERT ... RETURNING), с одним повтором. None — не вышло."""
+    for _ in range(2):
+        try:
+            return await pool.fetchrow(query, *args)
+        except (asyncpg.PostgresConnectionError, asyncpg.InterfaceError, OSError) as e:
+            log.warning("база недоступна, повтор: %s", e)
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            log.error("ошибка записи в базу: %s", e)
+            return None
+    return None
+
+
+async def storage_add_debt(key: str, label: str, title: str):
+    """Возвращает номер долга или None, если сохранить не удалось."""
+    if pool is None:
+        new_id = max(debts, default=0) + 1
+        debts[new_id] = {"key": key, "label": label, "title": title}
+        save_file()
+        return new_id
+    row = await db_fetchrow(
+        "INSERT INTO debts (user_key, label, title) VALUES ($1, $2, $3) RETURNING id",
+        key,
+        label,
+        title,
+    )
+    if row is None:
+        return None
+    debts[row["id"]] = {"key": key, "label": label, "title": title}
+    return row["id"]
+
+
+async def storage_del_debt(debt_id: int) -> bool:
+    debts.pop(debt_id, None)
+    return await db_exec("DELETE FROM debts WHERE id = $1", debt_id)
+
+
+async def storage_add_black(key: str, label: str, reason: str) -> bool:
+    blacklist[key] = {"label": label, "reason": reason}
+    return await db_exec(
+        "INSERT INTO blacklist (user_key, label, reason) VALUES ($1, $2, $3) "
+        "ON CONFLICT (user_key) DO UPDATE SET label = EXCLUDED.label, reason = EXCLUDED.reason",
+        key,
+        label,
+        reason,
+    )
+
+
+async def storage_del_black(key: str) -> bool:
+    blacklist.pop(key, None)
+    return await db_exec("DELETE FROM blacklist WHERE user_key = $1", key)
+
+
 # ---------------------------------------------------------------- helpers
 
 def user_key_label(user):
@@ -191,6 +269,18 @@ def is_num(token: str) -> bool:
 def is_top(game, key: str) -> bool:
     """Топ: постоянный (/top) или на эту игру (/vtop)."""
     return key in perm_tops or key in game["vtops"]
+
+
+def debt_mark(key: str) -> str:
+    """Пометка в конце записи: должник."""
+    titles = [html.escape(d["title"]) for d in debts.values() if d["key"] == key]
+    return f" 💸 должен {', '.join(titles)}" if titles else ""
+
+
+def black_message(label: str, own: bool) -> str:
+    if own:
+        return "Вы находитесь в черном списке, свяжитесь с администратором чата."
+    return f"{label} находится в черном списке, свяжитесь с администратором чата."
 
 
 def parse_numbers(tokens, top=False):
@@ -240,13 +330,14 @@ def render(game) -> str:
     if not players:
         lines.append("пока никого")
     drawn = game["drawn_set"]
-    for i, p in enumerate(players.values(), 1):
+    for i, (k, p) in enumerate(players.items(), 1):
         line = f"{i}. {p['label']}"
         if game["type"] == "bingo":
             nums = " ".join(f"{n}✅" if n in drawn else str(n) for n in p["numbers"])
             line += f" — {nums}"
             if p["strikes"]:
                 line += f" ⚠️ {p['strikes']}/{MAX_STRIKES}"
+        line += debt_mark(p.get("owner", k))
         lines.append(line)
     if not game["closed"]:
         lines += ["", how]
@@ -319,6 +410,32 @@ async def update_board(bot, chat_id, game):
 
 def is_bot_admin(user) -> bool:
     return user is not None and user.id in ADMIN_IDS
+
+
+def no_access_text(user) -> str:
+    uid = user.id if user else "неизвестен"
+    return (
+        f"Нет доступа. Ваш Telegram ID: {uid}\n"
+        "Если вы владелец бота, добавьте этот ID в переменную ADMIN_IDS на Render "
+        "(несколько ID через запятую) и дождитесь перезапуска."
+    )
+
+
+async def require_bot_admin(update: Update) -> bool:
+    """Проверка для /top, /untop, /tops: админ бота и разрешённый чат. Отказ — с понятным ответом."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat.type not in (ChatType.PRIVATE, ChatType.GROUP, ChatType.SUPERGROUP):
+        return False
+    if not is_bot_admin(user):
+        if chat.type == ChatType.PRIVATE:
+            await msg.reply_text(no_access_text(user))
+        elif chat.id in allowed_chats:
+            await msg.reply_text("Эта команда только для админов бота.")
+        return False
+    if chat.type != ChatType.PRIVATE and chat.id not in allowed_chats:
+        await msg.reply_text("Этот чат не добавлен в список. Напишите здесь /addchat.")
+        return False
+    return True
 
 
 async def is_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -613,9 +730,7 @@ async def cmd_vtop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Топ на постоянной основе (только админы бота из ADMIN_IDS)."""
     chat, msg = update.effective_chat, update.effective_message
-    if not is_bot_admin(update.effective_user):
-        return
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id not in allowed_chats:
+    if not await require_bot_admin(update):
         return
     t = target_from(update, context)
     if not t:
@@ -631,9 +746,7 @@ async def cmd_top(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_untop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, msg = update.effective_chat, update.effective_message
-    if not is_bot_admin(update.effective_user):
-        return
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id not in allowed_chats:
+    if not await require_bot_admin(update):
         return
     t = target_from(update, context)
     if not t:
@@ -655,15 +768,148 @@ async def cmd_untop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_tops(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, msg = update.effective_chat, update.effective_message
-    if not is_bot_admin(update.effective_user):
-        return
-    if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) and chat.id not in allowed_chats:
+    if not await require_bot_admin(update):
         return
     if not perm_tops:
         await msg.reply_text("Постоянных топов пока нет. Добавить: /top @юзер")
         return
     lines = [f"{i}. {label}" for i, label in enumerate(perm_tops.values(), 1)]
     await msg.reply_text("⭐ Постоянные топы:\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+# ---------------------------------------------------------------- должники и чёрный список (только админы бота)
+
+def target_and_rest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """(ключ, подпись) и остаток аргументов: «@юзер текст» или ответом на сообщение «текст»."""
+    args = list(context.args or [])
+    if args:
+        m = re.fullmatch(r"@(\w{3,})", args[0])
+        if m:
+            return ("@" + m.group(1).lower(), "@" + m.group(1)), args[1:]
+    r = update.effective_message.reply_to_message
+    if r and r.from_user and not r.from_user.is_bot:
+        return user_key_label(r.from_user), args
+    return None, args
+
+
+async def cmd_adolg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    t, rest = target_and_rest(update, context)
+    title = " ".join(rest).strip()[:100]
+    if not t or not title:
+        await msg.reply_text("Использование: /adolg @юзер название")
+        return
+    key, label = t
+    new_id = await storage_add_debt(key, label, title)
+    if new_id is None:
+        await msg.reply_text("⚠️ Не удалось сохранить в базу, попробуйте ещё раз.")
+        return
+    await msg.reply_text(
+        f"💸 Долг №{new_id}: {label} — {html.escape(title)}", parse_mode=ParseMode.HTML
+    )
+
+
+async def cmd_dolg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    if not debts:
+        await msg.reply_text("Должников нет.")
+        return
+    lines = [
+        f"№{i} — {d['label']} — {html.escape(d['title'])}" for i, d in sorted(debts.items())
+    ]
+    await msg.reply_text(
+        "💸 Список должников:\n" + "\n".join(lines) + "\n\nУдалить: /ddolg номер",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_ddolg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    if not context.args or not is_num(context.args[0]):
+        await msg.reply_text("Использование: /ddolg номер_долга (номера в /dolg)")
+        return
+    n = int(context.args[0])
+    d = debts.get(n)
+    if not d:
+        await msg.reply_text("Долга с таким номером нет. Смотрите /dolg")
+        return
+    ok = await storage_del_debt(n)
+    text = f"✅ Долг №{n} удалён: {d['label']} — {html.escape(d['title'])}"
+    if not ok:
+        text += "\n⚠️ Не удалось удалить из базы."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_ablack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    t, rest = target_and_rest(update, context)
+    if not t:
+        await msg.reply_text("Использование: /ablack @юзер [причина]")
+        return
+    key, label = t
+    reason = " ".join(rest).strip()[:100]
+    ok = await storage_add_black(key, label, reason)
+    text = f"🚫 {label} добавлен в черный список."
+    if reason:
+        text += f"\nПричина: {html.escape(reason)}"
+    if not ok:
+        text += "\n⚠️ Не удалось сохранить в базу, после перезапуска запись пропадёт."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_dblack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    key = None
+    if context.args and is_num(context.args[0]):  # номер из /black
+        n = int(context.args[0])
+        items = list(blacklist)
+        if 1 <= n <= len(items):
+            key = items[n - 1]
+    else:
+        t, _ = target_and_rest(update, context)
+        if t:
+            key = t[0]
+        else:
+            await msg.reply_text("Использование: /dblack @юзер (или номер из /black)")
+            return
+    if key is None or key not in blacklist:
+        await msg.reply_text("Этого человека нет в черном списке. Смотрите /black")
+        return
+    label = blacklist[key]["label"]
+    ok = await storage_del_black(key)
+    text = f"✅ {label} убран из черного списка."
+    if not ok:
+        text += "\n⚠️ Не удалось удалить из базы."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def cmd_black(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    if not blacklist:
+        await msg.reply_text("Черный список пуст.")
+        return
+    lines = []
+    for i, b in enumerate(blacklist.values(), 1):
+        line = f"{i}. {b['label']}"
+        if b.get("reason"):
+            line += f" — {html.escape(b['reason'])}"
+        lines.append(line)
+    await msg.reply_text(
+        "🚫 Черный список:\n" + "\n".join(lines) + "\n\nУбрать: /dblack @юзер или номер",
+        parse_mode=ParseMode.HTML,
+    )
 
 
 # ---------------------------------------------------------------- управление чатами (лс)
@@ -674,6 +920,7 @@ def bot_admin_private(func):
         if update.effective_chat.type != ChatType.PRIVATE:
             return
         if not is_bot_admin(update.effective_user):
+            await update.effective_message.reply_text(no_access_text(update.effective_user))
             return
         await func(update, context)
 
@@ -683,6 +930,8 @@ def bot_admin_private(func):
 async def cmd_addchat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
     if not is_bot_admin(user):
+        if chat.type == ChatType.PRIVATE:
+            await msg.reply_text(no_access_text(user))
         return
     if chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         target = chat  # /addchat прямо в группе добавляет эту группу
@@ -763,6 +1012,9 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = q.from_user
     key, label = user_key_label(user)
+    if key in blacklist:
+        await q.answer(black_message(label, True), show_alert=True)
+        return
 
     if game["type"] == "roulette":
         lim = roulette_add(game, key, label)
@@ -815,6 +1067,10 @@ async def roulette_text(update, context, game, text):
         key, label = "@" + name.lower(), "@" + name
     else:
         key, label = user_key_label(msg.from_user)
+    if key in blacklist:
+        own = key == user_key_label(msg.from_user)[0]
+        await msg.reply_text(black_message(label, own), parse_mode=ParseMode.HTML)
+        return
     lim = roulette_add(game, key, label)
     if lim:
         txt = f"{label} уже в списке." if lim == 1 else f"{label}: лимит записей ({lim}) исчерпан."
@@ -844,6 +1100,10 @@ async def bingo_text(update, context, game, text):
     # числа без «@»: после кнопки или ответом на сообщение бота
     if all(is_num(t) for t in tokens) and (uid in pending or to_bot):
         key, label = user_key_label(user)
+        if key in blacklist:
+            pending.discard(uid)
+            await msg.reply_text(black_message(label, True), parse_mode=ParseMode.HTML)
+            return
         top = is_top(game, key)
         if game["closed"]:
             pending.discard(uid)
@@ -889,6 +1149,9 @@ async def bingo_text(update, context, game, text):
     if not rest:
         if name:
             return  # "@юзер" без чисел игнорируем
+        if key in blacklist:
+            await msg.reply_text(black_message(label, True), parse_mode=ParseMode.HTML)
+            return
         if key in game["banned"]:
             await msg.reply_text("Вы исключены из игры.")
             return
@@ -899,6 +1162,10 @@ async def bingo_text(update, context, game, text):
         await prompt_numbers(context, chat_id, user, game)
         return
 
+    if key in blacklist:
+        own = key == user_key_label(user)[0]
+        await msg.reply_text(black_message(label, own), parse_mode=ParseMode.HTML)
+        return
     top = is_top(game, key)
     nums = parse_numbers(rest, top)
     if nums is None:
@@ -996,6 +1263,12 @@ async def main():
     app.add_handler(CommandHandler("top", cmd_top))
     app.add_handler(CommandHandler("untop", cmd_untop))
     app.add_handler(CommandHandler("tops", cmd_tops))
+    app.add_handler(CommandHandler("adolg", cmd_adolg))
+    app.add_handler(CommandHandler("ddolg", cmd_ddolg))
+    app.add_handler(CommandHandler("dolg", cmd_dolg))
+    app.add_handler(CommandHandler("ablack", cmd_ablack))
+    app.add_handler(CommandHandler("dblack", cmd_dblack))
+    app.add_handler(CommandHandler("black", cmd_black))
     app.add_handler(CommandHandler("addchat", cmd_addchat))
     app.add_handler(CommandHandler("delchat", cmd_delchat))
     app.add_handler(CommandHandler("chats", cmd_chats))
