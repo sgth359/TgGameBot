@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import time
 import urllib.parse
 
 import asyncpg
@@ -36,6 +37,7 @@ ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.str
 BINGO_MIN, BINGO_MAX, BINGO_COUNT = 1, 100, 5
 MAX_STRIKES = 3
 PING_INTERVAL = 600  # секунд
+TRIGGER_COOLDOWN = float(os.environ.get("TRIGGER_COOLDOWN", "10"))  # пауза между срабатываниями одного триггера в чате, сек
 
 # ---------------------------------------------------------------- состояние
 
@@ -47,6 +49,12 @@ perm_tops: dict[str, str] = {}
 debts: dict[int, dict] = {}
 # чёрный список: ключ игрока -> {"label", "reason"}
 blacklist: dict[str, dict] = {}
+# триггеры: номер -> {"phrase", "kind", "file_id", "text", "rx"}
+triggers: dict[int, dict] = {}
+trigger_last: dict[tuple[int, int], float] = {}
+# триггеры, ожидающие выбора «от лица бота / пересланное»: номер -> данные
+pending_triggers: dict[int, dict] = {}
+trigger_seq = 0
 # chat_id -> состояние игры
 games: dict[int, dict] = {}
 # (chat_id, user_id): человек нажал «Записаться» и сейчас должен прислать числа в чат
@@ -79,6 +87,10 @@ def load_file():
         perm_tops.update(d.get("tops", {}))
         debts.update({int(k): v for k, v in d.get("debts", {}).items()})
         blacklist.update(d.get("black", {}))
+        for k, v in d.get("triggers", {}).items():
+            triggers[int(k)] = make_trigger(
+                v["phrase"], v["kind"], v.get("file_id"), v.get("text"), v.get("src_chat"), v.get("src_msg")
+            )
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -94,6 +106,9 @@ def save_file():
                     "tops": perm_tops,
                     "debts": {str(k): v for k, v in debts.items()},
                     "black": blacklist,
+                    "triggers": {
+                        str(k): {x: y for x, y in t.items() if x != "rx"} for k, t in triggers.items()
+                    },
                 },
                 f,
                 ensure_ascii=False,
@@ -124,7 +139,12 @@ async def init_storage():
                 " title TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now());"
                 "CREATE TABLE IF NOT EXISTS blacklist ("
                 " user_key TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '',"
-                " reason TEXT NOT NULL DEFAULT '')"
+                " reason TEXT NOT NULL DEFAULT '');"
+                "CREATE TABLE IF NOT EXISTS triggers ("
+                " id BIGSERIAL PRIMARY KEY, phrase TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,"
+                " file_id TEXT, content TEXT);"
+                "ALTER TABLE triggers ADD COLUMN IF NOT EXISTS src_chat BIGINT;"
+                "ALTER TABLE triggers ADD COLUMN IF NOT EXISTS src_msg BIGINT"
             )
             for r in await c.fetch("SELECT chat_id, title FROM chats"):
                 allowed_chats[r["chat_id"]] = r["title"]
@@ -134,6 +154,12 @@ async def init_storage():
                 debts[r["id"]] = {"key": r["user_key"], "label": r["label"], "title": r["title"]}
             for r in await c.fetch("SELECT user_key, label, reason FROM blacklist"):
                 blacklist[r["user_key"]] = {"label": r["label"], "reason": r["reason"]}
+            for r in await c.fetch(
+                "SELECT id, phrase, kind, file_id, content, src_chat, src_msg FROM triggers ORDER BY id"
+            ):
+                triggers[r["id"]] = make_trigger(
+                    r["phrase"], r["kind"], r["file_id"], r["content"], r["src_chat"], r["src_msg"]
+                )
         log.info(
             "База подключена: чатов %d, топов %d, долгов %d, в черном списке %d",
             len(allowed_chats), len(perm_tops), len(debts), len(blacklist),
@@ -250,6 +276,68 @@ async def storage_add_black(key: str, label: str, reason: str) -> bool:
 async def storage_del_black(key: str) -> bool:
     blacklist.pop(key, None)
     return await db_exec("DELETE FROM blacklist WHERE user_key = $1", key)
+
+
+def compile_phrase(phrase: str):
+    """Фраза как отдельное слово/словосочетание, без учёта регистра."""
+    return re.compile(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", re.IGNORECASE)
+
+
+def make_trigger(phrase: str, kind: str, file_id, text, src_chat=None, src_msg=None) -> dict:
+    return {
+        "phrase": phrase,
+        "kind": kind,
+        "file_id": file_id,
+        "text": text,
+        "src_chat": src_chat,  # откуда пересылать (режим «пересланное»)
+        "src_msg": src_msg,
+        "rx": compile_phrase(phrase),
+    }
+
+
+async def storage_set_trigger(phrase: str, kind: str, file_id, text, src_chat=None, src_msg=None):
+    """Создаёт триггер или заменяет существующий с той же фразой. Возвращает номер или None."""
+    phrase = phrase.lower()
+    existing = next((i for i, t in triggers.items() if t["phrase"] == phrase), None)
+    if pool is None:
+        tid = existing or max(triggers, default=0) + 1
+    elif existing:
+        ok = await db_exec(
+            "UPDATE triggers SET kind = $2, file_id = $3, content = $4, src_chat = $5, src_msg = $6 "
+            "WHERE id = $1",
+            existing,
+            kind,
+            file_id,
+            text,
+            src_chat,
+            src_msg,
+        )
+        if not ok:
+            return None
+        tid = existing
+    else:
+        row = await db_fetchrow(
+            "INSERT INTO triggers (phrase, kind, file_id, content, src_chat, src_msg) "
+            "VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+            phrase,
+            kind,
+            file_id,
+            text,
+            src_chat,
+            src_msg,
+        )
+        if row is None:
+            return None
+        tid = row["id"]
+    triggers[tid] = make_trigger(phrase, kind, file_id, text, src_chat, src_msg)
+    if pool is None:
+        save_file()
+    return tid
+
+
+async def storage_del_trigger(trigger_id: int) -> bool:
+    triggers.pop(trigger_id, None)
+    return await db_exec("DELETE FROM triggers WHERE id = $1", trigger_id)
 
 
 # ---------------------------------------------------------------- helpers
@@ -912,6 +1000,273 @@ async def cmd_black(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------------------------------------------------------- триггеры
+
+KIND_NAMES = {
+    "text": "текст",
+    "sticker": "стикер",
+    "photo": "фото",
+    "animation": "гифка",
+    "video": "видео",
+    "video_note": "кружок",
+    "voice": "голосовое",
+    "audio": "аудио",
+    "document": "файл",
+    "forward": "сообщение",
+}
+
+TRIGGER_USAGE = (
+    "Как добавить триггер:\n"
+    "• ответьте на сообщение (стикер, фото, гифку, текст…) командой /atrigger слово — "
+    "бот спросит, отправлять его от лица бота или пересланным\n"
+    "• /atrigger слово | текст — простой текстовый ответ от лица бота\n"
+    "Фраза может состоять из нескольких слов."
+)
+
+
+def extract_content(r):
+    """Что бот будет отправлять копией: (тип, file_id, текст/подпись в HTML) или None."""
+    cap = r.caption_html if r.caption else None
+    if r.sticker:
+        return "sticker", r.sticker.file_id, None
+    if r.photo:
+        return "photo", r.photo[-1].file_id, cap
+    if r.animation:  # гифка приходит и как animation, и как document — проверяем раньше
+        return "animation", r.animation.file_id, cap
+    if r.video:
+        return "video", r.video.file_id, cap
+    if r.video_note:
+        return "video_note", r.video_note.file_id, None
+    if r.voice:
+        return "voice", r.voice.file_id, cap
+    if r.audio:
+        return "audio", r.audio.file_id, cap
+    if r.document:
+        return "document", r.document.file_id, cap
+    if r.text:
+        return "text", None, r.text_html
+    return None
+
+
+def trigger_mode_name(t) -> str:
+    name = KIND_NAMES.get(t["kind"], t["kind"])
+    if t.get("src_msg"):
+        return "↪️ пересылка" + ("" if t["kind"] == "forward" else f" ({name})")
+    return f"📤 от лица бота ({name})"
+
+
+def trigger_saved_text(tid: int) -> str:
+    t = triggers[tid]
+    text = f"✅ Триггер №{tid}: «{html.escape(t['phrase'])}» → {trigger_mode_name(t)}"
+    if t.get("src_msg"):
+        text += (
+            "\n\nНе удаляйте исходное сообщение из этого чата: бот пересылает именно его. "
+            "Если оно пропадёт, бот отправит обычную копию без премиум-эффектов."
+        )
+    return text
+
+
+async def cmd_atrigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global trigger_seq
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    first = (msg.text or "").split(None, 1)
+    raw = first[1] if len(first) > 1 else ""
+    phrase, _, inline = raw.partition("|")
+    phrase, inline = phrase.strip(), inline.strip()
+    if not phrase:
+        await msg.reply_text(TRIGGER_USAGE)
+        return
+    if not 2 <= len(phrase) <= 100:
+        await msg.reply_text("Фраза должна быть от 2 до 100 символов.")
+        return
+    r = msg.reply_to_message
+
+    if not r:
+        if not inline:
+            await msg.reply_text(TRIGGER_USAGE)
+            return
+        # текст прямо в команде — выбирать нечего, это сообщение от лица бота
+        tid = await storage_set_trigger(phrase, "text", None, html.escape(inline))
+        if tid is None:
+            await msg.reply_text("⚠️ Не удалось сохранить в базу, попробуйте ещё раз.")
+            return
+        await msg.reply_text(trigger_saved_text(tid), parse_mode=ParseMode.HTML)
+        return
+
+    # ответ на сообщение: спрашиваем, как отправлять
+    now = time.monotonic()
+    for k in [k for k, v in pending_triggers.items() if now - v["ts"] > 900]:
+        del pending_triggers[k]
+    trigger_seq += 1
+    content = extract_content(r)  # None, если это сообщение нельзя отправить копией
+    pending_triggers[trigger_seq] = {
+        "phrase": phrase,
+        "content": content,
+        "src_chat": r.chat.id,
+        "src_msg": r.message_id,
+        "ts": now,
+    }
+    row = []
+    if content is not None:
+        row.append(InlineKeyboardButton("📤 От лица бота", callback_data=f"tg:{trigger_seq}:bot"))
+    row.append(InlineKeyboardButton("↪️ Пересланное", callback_data=f"tg:{trigger_seq}:fwd"))
+    kb = InlineKeyboardMarkup([row, [InlineKeyboardButton("✖️ Отмена", callback_data=f"tg:{trigger_seq}:cancel")]])
+    text = (
+        f"Как отправлять триггер «{html.escape(phrase)}»?\n\n"
+        "📤 <b>От лица бота</b> — бот пришлёт копию, без пометки «Переслано» "
+        "(премиум-эффекты не сохраняются).\n"
+        "↪️ <b>Пересланное</b> — бот перешлёт исходное сообщение целиком "
+        "(сохраняются премиум-стикеры и эмодзи)."
+    )
+    if content is None:
+        text += "\n\nЭто сообщение нельзя отправить копией, доступна только пересылка."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+
+async def on_trigger_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not is_bot_admin(q.from_user):
+        await q.answer("Только для админов бота.", show_alert=True)
+        return
+    m = re.fullmatch(r"tg:(\d+):(bot|fwd|cancel)", q.data or "")
+    if not m:
+        await q.answer()
+        return
+    token, action = int(m.group(1)), m.group(2)
+    p = pending_triggers.get(token)
+    if not p:
+        await q.answer("Время вышло. Повторите /atrigger.", show_alert=True)
+        try:
+            await q.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+    if action == "cancel":
+        pending_triggers.pop(token, None)
+        await q.answer()
+        await q.edit_message_text("Отменено.")
+        return
+    if action == "bot":
+        if p["content"] is None:
+            await q.answer("Это сообщение нельзя отправить копией. Выберите пересылку.", show_alert=True)
+            return
+        kind, file_id, text = p["content"]
+        src_chat = src_msg = None
+    else:
+        kind, file_id, text = p["content"] or ("forward", None, None)
+        src_chat, src_msg = p["src_chat"], p["src_msg"]
+    tid = await storage_set_trigger(p["phrase"], kind, file_id, text, src_chat, src_msg)
+    if tid is None:
+        await q.answer("Не удалось сохранить в базу, попробуйте ещё раз.", show_alert=True)
+        return
+    pending_triggers.pop(token, None)
+    await q.answer("Готово")
+    await q.edit_message_text(trigger_saved_text(tid), parse_mode=ParseMode.HTML)
+
+
+async def cmd_triggers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    if not triggers:
+        await msg.reply_text("Триггеров нет. Добавить: /atrigger слово (ответом на сообщение)")
+        return
+    lines = [
+        f"№{i} — «{html.escape(t['phrase'])}» → {trigger_mode_name(t)}"
+        for i, t in sorted(triggers.items())
+    ]
+    text = "🔔 Триггеры:\n" + "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "\n…"
+    await msg.reply_text(text + "\n\nУдалить: /dtrigger номер", parse_mode=ParseMode.HTML)
+
+
+async def cmd_dtrigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not await require_bot_admin(update):
+        return
+    first = (msg.text or "").split(None, 1)
+    raw = first[1].strip() if len(first) > 1 else ""
+    if not raw:
+        await msg.reply_text("Использование: /dtrigger номер (или сама фраза). Список: /triggers")
+        return
+    if is_num(raw) and int(raw) in triggers:
+        tid = int(raw)
+    else:
+        tid = next((i for i, t in triggers.items() if t["phrase"] == raw.lower()), None)
+    if tid is None:
+        await msg.reply_text("Такого триггера нет. Смотрите /triggers")
+        return
+    phrase = triggers[tid]["phrase"]
+    ok = await storage_del_trigger(tid)
+    text = f"🗑 Триггер №{tid} удалён: «{html.escape(phrase)}»"
+    if not ok:
+        text += "\n⚠️ Не удалось удалить из базы."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+async def send_trigger(bot, msg, t):
+    # режим «пересланное»: пересылаем исходное сообщение, премиум-стикеры и эмодзи сохраняются
+    if t.get("src_chat") and t.get("src_msg"):
+        try:
+            await bot.forward_message(
+                chat_id=msg.chat_id,
+                from_chat_id=t["src_chat"],
+                message_id=t["src_msg"],
+                message_thread_id=msg.message_thread_id if msg.is_topic_message else None,
+            )
+            return
+        except Exception as e:
+            log.warning("пересылка триггера «%s» не удалась, отправляю копию: %s", t["phrase"], e)
+    if t["kind"] == "forward":
+        return  # копировать нечего
+    kind, fid, text = t["kind"], t["file_id"], t["text"]
+    cap = {"caption": text, "parse_mode": ParseMode.HTML} if text else {}
+    try:
+        if kind == "text":
+            await msg.reply_text(text, parse_mode=ParseMode.HTML)
+        elif kind == "sticker":
+            await msg.reply_sticker(fid)
+        elif kind == "photo":
+            await msg.reply_photo(fid, **cap)
+        elif kind == "animation":
+            await msg.reply_animation(fid, **cap)
+        elif kind == "video":
+            await msg.reply_video(fid, **cap)
+        elif kind == "video_note":
+            await msg.reply_video_note(fid)
+        elif kind == "voice":
+            await msg.reply_voice(fid, **cap)
+        elif kind == "audio":
+            await msg.reply_audio(fid, **cap)
+        elif kind == "document":
+            await msg.reply_document(fid, **cap)
+    except Exception as e:
+        log.warning("не удалось отправить триггер «%s»: %s", t["phrase"], e)
+
+
+async def on_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Срабатывает в разрешённых чатах всегда, независимо от того, идёт ли игра."""
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+    if not msg or chat_id not in allowed_chats or not triggers:
+        return
+    text = msg.text or msg.caption
+    if not text:
+        return
+    # сначала самые длинные фразы, на одно сообщение срабатывает один триггер
+    for tid, t in sorted(triggers.items(), key=lambda kv: -len(kv[1]["phrase"])):
+        if t["rx"].search(text):
+            now = time.monotonic()
+            if now - trigger_last.get((chat_id, tid), -1e9) < TRIGGER_COOLDOWN:
+                return
+            trigger_last[(chat_id, tid)] = now
+            await send_trigger(context.bot, msg, t)
+            return
+
+
 # ---------------------------------------------------------------- управление чатами (лс)
 
 def bot_admin_private(func):
@@ -1269,12 +1624,25 @@ async def main():
     app.add_handler(CommandHandler("ablack", cmd_ablack))
     app.add_handler(CommandHandler("dblack", cmd_dblack))
     app.add_handler(CommandHandler("black", cmd_black))
+    app.add_handler(CommandHandler("atrigger", cmd_atrigger))
+    app.add_handler(CommandHandler("dtrigger", cmd_dtrigger))
+    app.add_handler(CommandHandler("triggers", cmd_triggers))
     app.add_handler(CommandHandler("addchat", cmd_addchat))
     app.add_handler(CommandHandler("delchat", cmd_delchat))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CallbackQueryHandler(on_join, pattern="^join$"))
+    app.add_handler(CallbackQueryHandler(on_trigger_choice, pattern="^tg:"))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, on_group_text)
+    )
+
+    # триггеры — отдельная группа обработчиков, работает параллельно с играми
+    app.add_handler(
+        MessageHandler(
+            (filters.TEXT | filters.CAPTION) & ~filters.COMMAND & filters.ChatType.GROUPS,
+            on_trigger,
+        ),
+        group=1,
     )
 
     # веб-сервер поднимаем первым, чтобы Render сразу увидел открытый порт
