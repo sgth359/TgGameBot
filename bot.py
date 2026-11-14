@@ -49,7 +49,7 @@ perm_tops: dict[str, str] = {}
 debts: dict[int, dict] = {}
 # чёрный список: ключ игрока -> {"label", "reason"}
 blacklist: dict[str, dict] = {}
-# триггеры: номер -> {"phrase", "kind", "file_id", "text", "rx"}
+# триггеры: номер -> {"phrase", "kind", "file_id", "text", "src_chat", "src_msg"}
 triggers: dict[int, dict] = {}
 trigger_last: dict[tuple[int, int], float] = {}
 # триггеры, ожидающие выбора «от лица бота / пересланное»: номер -> данные
@@ -107,7 +107,7 @@ def save_file():
                     "debts": {str(k): v for k, v in debts.items()},
                     "black": blacklist,
                     "triggers": {
-                        str(k): {x: y for x, y in t.items() if x != "rx"} for k, t in triggers.items()
+                        str(k): dict(t) for k, t in triggers.items()
                     },
                 },
                 f,
@@ -278,11 +278,6 @@ async def storage_del_black(key: str) -> bool:
     return await db_exec("DELETE FROM blacklist WHERE user_key = $1", key)
 
 
-def compile_phrase(phrase: str):
-    """Фраза как отдельное слово/словосочетание, без учёта регистра."""
-    return re.compile(r"(?<!\w)" + re.escape(phrase) + r"(?!\w)", re.IGNORECASE)
-
-
 def make_trigger(phrase: str, kind: str, file_id, text, src_chat=None, src_msg=None) -> dict:
     return {
         "phrase": phrase,
@@ -291,7 +286,6 @@ def make_trigger(phrase: str, kind: str, file_id, text, src_chat=None, src_msg=N
         "text": text,
         "src_chat": src_chat,  # откуда пересылать (режим «пересланное»)
         "src_msg": src_msg,
-        "rx": compile_phrase(phrase),
     }
 
 
@@ -1020,7 +1014,8 @@ TRIGGER_USAGE = (
     "• ответьте на сообщение (стикер, фото, гифку, текст…) командой /atrigger слово — "
     "бот спросит, отправлять его от лица бота или пересланным\n"
     "• /atrigger слово | текст — простой текстовый ответ от лица бота\n"
-    "Фраза может состоять из нескольких слов."
+    "Фраза может состоять из нескольких слов. Триггер срабатывает, только когда сообщение "
+    "целиком совпадает с фразой (регистр букв не важен)."
 )
 
 
@@ -1058,6 +1053,7 @@ def trigger_mode_name(t) -> str:
 def trigger_saved_text(tid: int) -> str:
     t = triggers[tid]
     text = f"✅ Триггер №{tid}: «{html.escape(t['phrase'])}» → {trigger_mode_name(t)}"
+    text += "\nСрабатывает, когда сообщение целиком совпадает с фразой (регистр не важен)."
     if t.get("src_msg"):
         text += (
             "\n\nНе удаляйте исходное сообщение из этого чата: бот пересылает именно его. "
@@ -1256,9 +1252,10 @@ async def on_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text or msg.caption
     if not text:
         return
-    # сначала самые длинные фразы, на одно сообщение срабатывает один триггер
-    for tid, t in sorted(triggers.items(), key=lambda kv: -len(kv[1]["phrase"])):
-        if t["rx"].search(text):
+    # строгое совпадение: всё сообщение целиком равно фразе, регистр букв не важен
+    norm = text.strip().lower()
+    for tid, t in triggers.items():
+        if t["phrase"] == norm:
             now = time.monotonic()
             if now - trigger_last.get((chat_id, tid), -1e9) < TRIGGER_COOLDOWN:
                 return
