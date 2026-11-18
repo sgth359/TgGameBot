@@ -8,15 +8,19 @@ import random
 import re
 import time
 import urllib.parse
+from collections import deque
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import asyncpg
 import httpx
 from aiohttp import web
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import ChatPermissions, ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatMemberStatus, ChatType, ParseMode
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -39,6 +43,12 @@ MAX_STRIKES = 3
 PING_INTERVAL = 600  # секунд
 TRIGGER_COOLDOWN = float(os.environ.get("TRIGGER_COOLDOWN", "10"))  # пауза между срабатываниями одного триггера в чате, сек
 
+WARN_LIMIT = int(os.environ.get("WARN_LIMIT", "3"))  # предупреждений до автомута (по умолчанию; меняется в /settings)
+WARN_MUTE_HOURS = int(os.environ.get("WARN_MUTE_HOURS", "24"))  # длительность автомута, часы (по умолчанию)
+DEFAULT_MUTE_SECONDS = int(os.environ.get("DEFAULT_MUTE_MINUTES", "60")) * 60  # /mute без времени
+DEFAULT_TZ = os.environ.get("DEFAULT_TZ", "Europe/Moscow")  # часовой пояс ночного режима по умолчанию
+NOTICE_SECONDS = 15  # через сколько секунд удаляются предупреждения бота
+
 # ---------------------------------------------------------------- состояние
 
 # разрешённые чаты: chat_id -> название (кэш, источник правды — база)
@@ -55,6 +65,33 @@ trigger_last: dict[tuple[int, int], float] = {}
 # триггеры, ожидающие выбора «от лица бота / пересланное»: номер -> данные
 pending_triggers: dict[int, dict] = {}
 trigger_seq = 0
+# --- защитник
+# кому разрешены ссылки: chat_id -> {ключ игрока: подпись}
+link_allow: dict[int, dict[str, str]] = {}
+# стоп-слова: chat_id -> [слова в нижнем регистре]
+stopwords: dict[int, list[str]] = {}
+# настройки чата (меняются в /settings): chat_id -> {имя: значение}
+chat_settings: dict[int, dict] = {}
+DEFAULT_SETTINGS = {
+    "antilink": True,
+    "night": False,
+    "night_start": "00:00",
+    "night_end": "08:00",
+    "tz": DEFAULT_TZ,
+    "night_locked": False,  # чат сейчас закрыт ночным режимом
+    "night_perms": None,  # права чата до закрытия (чтобы вернуть как было)
+    "warn_limit": WARN_LIMIT,
+    "warn_mute_h": WARN_MUTE_HOURS,
+}
+# предупреждения: (chat_id, user_id) -> количество
+warns: dict[tuple[int, int], int] = {}
+# username (в нижнем регистре) -> user_id: нужно, чтобы работали /ban @юзер и т. п.
+seen_users: dict[str, int] = {}
+admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+# ждём ответ от админа в личке (своё время ночи, часовой пояс, новое стоп-слово)
+dm_input: dict[int, dict] = {}
+night_retry_at: dict[int, float] = {}
+_bg_tasks: set = set()
 # chat_id -> состояние игры
 games: dict[int, dict] = {}
 # (chat_id, user_id): человек нажал «Записаться» и сейчас должен прислать числа в чат
@@ -91,6 +128,15 @@ def load_file():
             triggers[int(k)] = make_trigger(
                 v["phrase"], v["kind"], v.get("file_id"), v.get("text"), v.get("src_chat"), v.get("src_msg")
             )
+        for c, m in d.get("link_allow", {}).items():
+            link_allow[int(c)] = dict(m)
+        for c, w in d.get("stopwords", {}).items():
+            stopwords[int(c)] = list(w)
+        for c, st in d.get("chat_settings", {}).items():
+            chat_settings[int(c)] = dict(st)
+        for k, n in d.get("warns", {}).items():
+            c, u = k.split(":")
+            warns[(int(c), int(u))] = n
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -109,6 +155,10 @@ def save_file():
                     "triggers": {
                         str(k): dict(t) for k, t in triggers.items()
                     },
+                    "link_allow": {str(c): m for c, m in link_allow.items()},
+                    "stopwords": {str(c): w for c, w in stopwords.items()},
+                    "chat_settings": {str(c): st for c, st in chat_settings.items()},
+                    "warns": {f"{c}:{u}": n for (c, u), n in warns.items()},
                 },
                 f,
                 ensure_ascii=False,
@@ -144,22 +194,49 @@ async def init_storage():
                 " id BIGSERIAL PRIMARY KEY, phrase TEXT NOT NULL UNIQUE, kind TEXT NOT NULL,"
                 " file_id TEXT, content TEXT);"
                 "ALTER TABLE triggers ADD COLUMN IF NOT EXISTS src_chat BIGINT;"
-                "ALTER TABLE triggers ADD COLUMN IF NOT EXISTS src_msg BIGINT"
+                "ALTER TABLE triggers ADD COLUMN IF NOT EXISTS src_msg BIGINT;"
+                "ALTER TABLE debts ADD COLUMN IF NOT EXISTS user_id BIGINT;"
+                "ALTER TABLE blacklist ADD COLUMN IF NOT EXISTS user_id BIGINT;"
+                "CREATE TABLE IF NOT EXISTS link_allow (chat_id BIGINT NOT NULL, user_key TEXT NOT NULL,"
+                " label TEXT NOT NULL DEFAULT '', PRIMARY KEY (chat_id, user_key));"
+                "CREATE TABLE IF NOT EXISTS stopwords (chat_id BIGINT NOT NULL, word TEXT NOT NULL,"
+                " PRIMARY KEY (chat_id, word));"
+                "CREATE TABLE IF NOT EXISTS chat_cfg (chat_id BIGINT PRIMARY KEY, data TEXT NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS warns (chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL,"
+                " cnt INT NOT NULL, PRIMARY KEY (chat_id, user_id));"
+                "CREATE TABLE IF NOT EXISTS seen_users (username TEXT PRIMARY KEY, user_id BIGINT NOT NULL)"
             )
             for r in await c.fetch("SELECT chat_id, title FROM chats"):
                 allowed_chats[r["chat_id"]] = r["title"]
             for r in await c.fetch("SELECT user_key, label FROM tops"):
                 perm_tops[r["user_key"]] = r["label"]
-            for r in await c.fetch("SELECT id, user_key, label, title FROM debts ORDER BY id"):
-                debts[r["id"]] = {"key": r["user_key"], "label": r["label"], "title": r["title"]}
-            for r in await c.fetch("SELECT user_key, label, reason FROM blacklist"):
-                blacklist[r["user_key"]] = {"label": r["label"], "reason": r["reason"]}
+            for r in await c.fetch("SELECT id, user_key, label, title, user_id FROM debts ORDER BY id"):
+                debts[r["id"]] = {
+                    "key": r["user_key"], "label": r["label"], "title": r["title"], "uid": r["user_id"],
+                }
+            for r in await c.fetch("SELECT user_key, label, reason, user_id FROM blacklist"):
+                blacklist[r["user_key"]] = {"label": r["label"], "reason": r["reason"], "uid": r["user_id"]}
             for r in await c.fetch(
                 "SELECT id, phrase, kind, file_id, content, src_chat, src_msg FROM triggers ORDER BY id"
             ):
                 triggers[r["id"]] = make_trigger(
                     r["phrase"], r["kind"], r["file_id"], r["content"], r["src_chat"], r["src_msg"]
                 )
+            for r in await c.fetch("SELECT chat_id, user_key, label FROM link_allow"):
+                link_allow.setdefault(r["chat_id"], {})[r["user_key"]] = r["label"]
+            for r in await c.fetch("SELECT chat_id, word FROM stopwords"):
+                stopwords.setdefault(r["chat_id"], []).append(r["word"])
+            try:  # настройки из прошлой версии (таблица chat_settings), если она есть
+                for r in await c.fetch("SELECT chat_id, antilink FROM chat_settings"):
+                    chat_settings.setdefault(r["chat_id"], {})["antilink"] = r["antilink"]
+            except Exception:
+                pass
+            for r in await c.fetch("SELECT chat_id, data FROM chat_cfg"):
+                chat_settings.setdefault(r["chat_id"], {}).update(json.loads(r["data"]))
+            for r in await c.fetch("SELECT chat_id, user_id, cnt FROM warns"):
+                warns[(r["chat_id"], r["user_id"])] = r["cnt"]
+            for r in await c.fetch("SELECT username, user_id FROM seen_users"):
+                seen_users[r["username"]] = r["user_id"]
         log.info(
             "База подключена: чатов %d, топов %d, долгов %d, в черном списке %d",
             len(allowed_chats), len(perm_tops), len(debts), len(blacklist),
@@ -238,22 +315,23 @@ async def db_fetchrow(query: str, *args):
     return None
 
 
-async def storage_add_debt(key: str, label: str, title: str):
+async def storage_add_debt(key: str, label: str, title: str, uid=None):
     """Возвращает номер долга или None, если сохранить не удалось."""
     if pool is None:
         new_id = max(debts, default=0) + 1
-        debts[new_id] = {"key": key, "label": label, "title": title}
+        debts[new_id] = {"key": key, "label": label, "title": title, "uid": uid}
         save_file()
         return new_id
     row = await db_fetchrow(
-        "INSERT INTO debts (user_key, label, title) VALUES ($1, $2, $3) RETURNING id",
+        "INSERT INTO debts (user_key, label, title, user_id) VALUES ($1, $2, $3, $4) RETURNING id",
         key,
         label,
         title,
+        uid,
     )
     if row is None:
         return None
-    debts[row["id"]] = {"key": key, "label": label, "title": title}
+    debts[row["id"]] = {"key": key, "label": label, "title": title, "uid": uid}
     return row["id"]
 
 
@@ -262,14 +340,18 @@ async def storage_del_debt(debt_id: int) -> bool:
     return await db_exec("DELETE FROM debts WHERE id = $1", debt_id)
 
 
-async def storage_add_black(key: str, label: str, reason: str) -> bool:
-    blacklist[key] = {"label": label, "reason": reason}
+async def storage_add_black(key: str, label: str, reason: str, uid=None) -> bool:
+    old_uid = blacklist.get(key, {}).get("uid")
+    uid = uid or old_uid
+    blacklist[key] = {"label": label, "reason": reason, "uid": uid}
     return await db_exec(
-        "INSERT INTO blacklist (user_key, label, reason) VALUES ($1, $2, $3) "
-        "ON CONFLICT (user_key) DO UPDATE SET label = EXCLUDED.label, reason = EXCLUDED.reason",
+        "INSERT INTO blacklist (user_key, label, reason, user_id) VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (user_key) DO UPDATE SET label = EXCLUDED.label, reason = EXCLUDED.reason, "
+        "user_id = EXCLUDED.user_id",
         key,
         label,
         reason,
+        uid,
     )
 
 
@@ -334,6 +416,99 @@ async def storage_del_trigger(trigger_id: int) -> bool:
     return await db_exec("DELETE FROM triggers WHERE id = $1", trigger_id)
 
 
+def spawn(coro):
+    """Фоновая задача (чтобы не ждать запись в базу)."""
+    task = asyncio.create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def setting(chat_id: int, name: str):
+    return chat_settings.get(chat_id, {}).get(name, DEFAULT_SETTINGS[name])
+
+
+async def storage_allow_link(chat_id: int, keys: list, label: str) -> bool:
+    ok = True
+    for k in keys:
+        link_allow.setdefault(chat_id, {})[k] = label
+        ok = await db_exec(
+            "INSERT INTO link_allow (chat_id, user_key, label) VALUES ($1, $2, $3) "
+            "ON CONFLICT (chat_id, user_key) DO UPDATE SET label = EXCLUDED.label",
+            chat_id,
+            k,
+            label,
+        ) and ok
+    return ok
+
+
+async def storage_deny_link(chat_id: int, keys: list) -> bool:
+    ok = True
+    for k in keys:
+        link_allow.get(chat_id, {}).pop(k, None)
+        ok = await db_exec(
+            "DELETE FROM link_allow WHERE chat_id = $1 AND user_key = $2", chat_id, k
+        ) and ok
+    return ok
+
+
+async def storage_add_word(chat_id: int, word: str) -> bool:
+    words = stopwords.setdefault(chat_id, [])
+    if word not in words:
+        words.append(word)
+    return await db_exec(
+        "INSERT INTO stopwords (chat_id, word) VALUES ($1, $2) ON CONFLICT DO NOTHING", chat_id, word
+    )
+
+
+async def storage_del_word(chat_id: int, word: str) -> bool:
+    if word in stopwords.get(chat_id, []):
+        stopwords[chat_id].remove(word)
+    return await db_exec("DELETE FROM stopwords WHERE chat_id = $1 AND word = $2", chat_id, word)
+
+
+async def storage_save_cfg(chat_id: int) -> bool:
+    """Все настройки чата одной JSON-строкой."""
+    data = json.dumps(chat_settings.get(chat_id, {}), ensure_ascii=False)
+    return await db_exec(
+        "INSERT INTO chat_cfg (chat_id, data) VALUES ($1, $2) "
+        "ON CONFLICT (chat_id) DO UPDATE SET data = EXCLUDED.data",
+        chat_id,
+        data,
+    )
+
+
+async def storage_set_setting(chat_id: int, name: str, value) -> bool:
+    chat_settings.setdefault(chat_id, {})[name] = value
+    return await storage_save_cfg(chat_id)
+
+
+async def storage_set_warns(chat_id: int, user_id: int, n: int) -> bool:
+    if n <= 0:
+        warns.pop((chat_id, user_id), None)
+        return await db_exec("DELETE FROM warns WHERE chat_id = $1 AND user_id = $2", chat_id, user_id)
+    warns[(chat_id, user_id)] = n
+    return await db_exec(
+        "INSERT INTO warns (chat_id, user_id, cnt) VALUES ($1, $2, $3) "
+        "ON CONFLICT (chat_id, user_id) DO UPDATE SET cnt = EXCLUDED.cnt",
+        chat_id,
+        user_id,
+        n,
+    )
+
+
+async def storage_seen(username: str, user_id: int):
+    seen_users[username] = user_id
+    if pool is not None:  # в базу пишем в фоне и только при изменении
+        spawn(
+            db_exec(
+                "INSERT INTO seen_users (username, user_id) VALUES ($1, $2) "
+                "ON CONFLICT (username) DO UPDATE SET user_id = EXCLUDED.user_id",
+                username,
+                user_id,
+            )
+        )
+
+
 # ---------------------------------------------------------------- helpers
 
 def user_key_label(user):
@@ -353,10 +528,72 @@ def is_top(game, key: str) -> bool:
     return key in perm_tops or key in game["vtops"]
 
 
+def key_uid(key: str):
+    """ID человека по ключу: «id:123» или «@ник» (если бот уже видел этого человека)."""
+    if key.startswith("id:"):
+        return int(key[3:])
+    return seen_users.get(key[1:])
+
+
+def self_uid(user, key: str):
+    """ID пишущего, если ключ — его собственный (а не чужой «@юзер» из команды)."""
+    return user.id if key == user_key_label(user)[0] else None
+
+
+def find_black(key: str, uid=None):
+    """Ищет человека в чёрном списке и по @нику, и по ID — так он не уйдёт от списка сменой ника.
+    -> (ключ записи, запись) или (None, None)."""
+    if key in blacklist:
+        return key, blacklist[key]
+    uid = uid or key_uid(key)
+    if uid:
+        if f"id:{uid}" in blacklist:
+            return f"id:{uid}", blacklist[f"id:{uid}"]
+        for k, e in blacklist.items():
+            if e.get("uid") == uid:
+                return k, e
+    return None, None
+
+
+def black_entry(key: str, uid=None):
+    return find_black(key, uid)[1]
+
+
 def debt_mark(key: str) -> str:
-    """Пометка в конце записи: должник."""
-    titles = [html.escape(d["title"]) for d in debts.values() if d["key"] == key]
+    """Пометка в конце записи: должник (находим и по @нику, и по ID)."""
+    uid = key_uid(key)
+    titles = [
+        html.escape(d["title"])
+        for d in debts.values()
+        if d["key"] == key or (uid and d.get("uid") == uid)
+    ]
     return f" 💸 должен {', '.join(titles)}" if titles else ""
+
+
+async def sync_identity(user):
+    """Привязывает долги и чёрный список к ID человека и обновляет его текущий ник в подписях."""
+    if not debts and not blacklist:
+        return
+    key, label = user_key_label(user)
+    for did, d in debts.items():
+        if d.get("uid") == user.id or (d.get("uid") is None and d["key"] == key):
+            if d.get("uid") != user.id or d["label"] != label:
+                d["uid"], d["label"] = user.id, label
+                spawn(db_exec("UPDATE debts SET user_id = $2, label = $3 WHERE id = $1", did, user.id, label))
+    for k, e in blacklist.items():
+        if e.get("uid") == user.id or (e.get("uid") is None and k == key):
+            if e.get("uid") != user.id or e["label"] != label:
+                e["uid"], e["label"] = user.id, label
+                spawn(db_exec("UPDATE blacklist SET user_id = $2, label = $3 WHERE user_key = $1", k, user.id, label))
+
+
+async def track_user(user):
+    """Запоминаем ник -> ID и привязываем человека к долгам и чёрному списку."""
+    if user.username:
+        low = user.username.lower()
+        if seen_users.get(low) != user.id:
+            await storage_seen(low, user.id)
+    await sync_identity(user)
 
 
 def black_message(label: str, own: bool) -> str:
@@ -616,9 +853,19 @@ def target_from(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
+    arg = context.args[0] if context.args else ""
+    m = re.fullmatch(r"cfg_(-?\d+)", arg)
+    if m:  # переход из группы по кнопке «Открыть настройки»
+        chat_id = int(m.group(1))
+        if await can_manage(context.bot, chat_id, update.effective_user):
+            text, markup = main_menu(chat_id)
+            await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        else:
+            await update.message.reply_text("Нет доступа к настройкам этого чата.")
+        return
     await update.message.reply_text(
-        "Привет! Я бот для игр в группе: рулетка и бинго. "
-        "Игры запускают админы группы командами /roulette и /bingo."
+        "Привет! Я бот для игр и защиты группы. Игры запускают админы командами /roulette и /bingo, "
+        "настройки чата открываются здесь: /settings."
     )
 
 
@@ -703,7 +950,7 @@ async def cmd_random(update: Update, context: ContextTypes.DEFAULT_TYPE):
     players = list(game["players"].values())
     n = random.randint(1, len(players))
     await update.effective_message.reply_text(
-        f"🎲 Выпало число <b>{n}</b> из {len(players)} — {players[n - 1]['label']}",
+        f"🎲 Выпало число <b>{n}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -862,15 +1109,20 @@ async def cmd_tops(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------- должники и чёрный список (только админы бота)
 
 def target_and_rest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """(ключ, подпись) и остаток аргументов: «@юзер текст» или ответом на сообщение «текст»."""
+    """(ключ, подпись, ID или None) и остаток аргументов: «@юзер текст», «ID текст» или ответом на сообщение."""
     args = list(context.args or [])
     if args:
         m = re.fullmatch(r"@(\w{3,})", args[0])
         if m:
-            return ("@" + m.group(1).lower(), "@" + m.group(1)), args[1:]
+            low = m.group(1).lower()
+            return ("@" + low, "@" + m.group(1), seen_users.get(low)), args[1:]
+        if re.fullmatch(r"\d{5,}", args[0]):
+            uid = int(args[0])
+            return (f"id:{uid}", f'<a href="tg://user?id={uid}">{uid}</a>', uid), args[1:]
     r = update.effective_message.reply_to_message
     if r and r.from_user and not r.from_user.is_bot:
-        return user_key_label(r.from_user), args
+        key, label = user_key_label(r.from_user)
+        return (key, label, r.from_user.id), args
     return None, args
 
 
@@ -881,10 +1133,10 @@ async def cmd_adolg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t, rest = target_and_rest(update, context)
     title = " ".join(rest).strip()[:100]
     if not t or not title:
-        await msg.reply_text("Использование: /adolg @юзер название")
+        await msg.reply_text("Использование: /adolg @юзер название (или ID, или ответом на сообщение)")
         return
-    key, label = t
-    new_id = await storage_add_debt(key, label, title)
+    key, label, uid = t
+    new_id = await storage_add_debt(key, label, title, uid)
     if new_id is None:
         await msg.reply_text("⚠️ Не удалось сохранить в базу, попробуйте ещё раз.")
         return
@@ -934,11 +1186,14 @@ async def cmd_ablack(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     t, rest = target_and_rest(update, context)
     if not t:
-        await msg.reply_text("Использование: /ablack @юзер [причина]")
+        await msg.reply_text("Использование: /ablack @юзер [причина] (или ID, или ответом на сообщение)")
         return
-    key, label = t
+    key, label, uid = t
+    old_key, _ = find_black(key, uid)  # человек уже в списке под старым ником — обновляем ту же запись
+    if old_key:
+        key = old_key
     reason = " ".join(rest).strip()[:100]
-    ok = await storage_add_black(key, label, reason)
+    ok = await storage_add_black(key, label, reason, uid)
     text = f"🚫 {label} добавлен в черный список."
     if reason:
         text += f"\nПричина: {html.escape(reason)}"
@@ -952,18 +1207,16 @@ async def cmd_dblack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_bot_admin(update):
         return
     key = None
-    if context.args and is_num(context.args[0]):  # номер из /black
-        n = int(context.args[0])
-        items = list(blacklist)
-        if 1 <= n <= len(items):
-            key = items[n - 1]
+    arg = context.args[0] if context.args else ""
+    items = list(blacklist)
+    if is_num(arg) and 1 <= int(arg) <= len(items):  # номер из /black
+        key = items[int(arg) - 1]
     else:
         t, _ = target_and_rest(update, context)
-        if t:
-            key = t[0]
-        else:
-            await msg.reply_text("Использование: /dblack @юзер (или номер из /black)")
+        if not t:
+            await msg.reply_text("Использование: /dblack @юзер, ID или номер из /black")
             return
+        key, _entry = find_black(t[0], t[2])
     if key is None or key not in blacklist:
         await msg.reply_text("Этого человека нет в черном списке. Смотрите /black")
         return
@@ -1264,6 +1517,1182 @@ async def on_trigger(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
+# ---------------------------------------------------------------- защитник: ссылки, бан, мут, предупреждения
+
+LINK_RX = re.compile(r"(https?://|www\.|(?:t|telegram)\.me/)", re.IGNORECASE)
+DURATION_RX = re.compile(r"(\d+)(мин|min|м|m|ч|h|д|d|н|w)")
+DURATION_UNITS = {
+    "мин": 60, "min": 60, "м": 60, "m": 60,
+    "ч": 3600, "h": 3600,
+    "д": 86400, "d": 86400,
+    "н": 604800, "w": 604800,
+}
+EMOJI_RX = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F\u200D]")
+NO_TARGET = (
+    "Укажите пользователя: ответьте командой на его сообщение или напишите @юзер / ID.\n"
+    "(@юзер работает, если бот уже видел сообщения этого человека в чате.)"
+)
+DEFAULT_PERMS = {
+    "can_send_messages": True, "can_send_audios": True, "can_send_documents": True,
+    "can_send_photos": True, "can_send_videos": True, "can_send_video_notes": True,
+    "can_send_voice_notes": True, "can_send_polls": True, "can_send_other_messages": True,
+    "can_add_web_page_previews": True, "can_invite_users": True,
+}
+
+
+def fmt_duration(sec: int) -> str:
+    d, rem = divmod(int(sec), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    parts = []
+    if d:
+        parts.append(f"{d} д")
+    if h:
+        parts.append(f"{h} ч")
+    if m and not d:
+        parts.append(f"{m} мин")
+    return " ".join(parts) or "1 мин"
+
+
+def parse_duration(tokens):
+    """«30м», «2ч», «1д», «1н» (или m/h/d/w) в начале аргументов -> (секунды или None, остаток текстом)."""
+    if tokens:
+        m = DURATION_RX.fullmatch(tokens[0].lower())
+        if m:
+            secs = int(m.group(1)) * DURATION_UNITS[m.group(2)]
+            if secs >= 60:
+                return secs, " ".join(tokens[1:]).strip()
+    return None, " ".join(tokens).strip()
+
+
+def has_link(msg) -> bool:
+    for e in list(msg.entities or ()) + list(msg.caption_entities or ()):
+        if e.type in ("url", "text_link"):
+            return True
+    return bool(LINK_RX.search(msg.text or msg.caption or ""))
+
+
+def link_allowed(chat_id: int, user) -> bool:
+    allowed = link_allow.get(chat_id, {})
+    if f"id:{user.id}" in allowed:
+        return True
+    return bool(user.username) and ("@" + user.username.lower()) in allowed
+
+
+async def tg_api(method: str, **params):
+    """Прямой вызов Bot API (для новых методов, которых нет в установленной версии библиотеки)."""
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(f"https://api.telegram.org/bot{TOKEN}/{method}", json=params)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description", "ошибка Telegram"))
+    return data.get("result")
+
+
+async def is_exempt(bot, chat_id: int, user) -> bool:
+    """Админы чата и админы бота не наказываются (статус админа кэшируется на 5 минут)."""
+    if user.id in ADMIN_IDS:
+        return True
+    key, now = (chat_id, user.id), time.monotonic()
+    cached = admin_cache.get(key)
+    if cached and now - cached[0] < 300:
+        return cached[1]
+    try:
+        member = await bot.get_chat_member(chat_id, user.id)
+        res = member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception as e:
+        log.warning("не удалось проверить статус админа: %s", e)
+        res = False
+    admin_cache[key] = (now, res)
+    return res
+
+
+async def is_protected(bot, chat_id: int, uid: int) -> bool:
+    """Нельзя банить/мутить: сам бот, админы бота и админы чата."""
+    if uid == bot.id or uid in ADMIN_IDS:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, uid)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception:
+        return False
+
+
+async def delete_later(bot, chat_id: int, message_id: int, delay: int = NOTICE_SECONDS):
+    await asyncio.sleep(delay)
+    try:
+        await bot.delete_message(chat_id, message_id)
+    except Exception:
+        pass
+
+
+async def notice(bot, chat_id: int, text: str, thread=None):
+    """Короткое сообщение бота, которое само удаляется."""
+    try:
+        m = await bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, message_thread_id=thread)
+        spawn(delete_later(bot, chat_id, m.message_id))
+    except Exception as e:
+        log.warning("не удалось отправить уведомление: %s", e)
+
+
+async def do_mute(bot, chat_id: int, uid: int, seconds: int):
+    until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
+    await bot.restrict_chat_member(chat_id, uid, ChatPermissions(can_send_messages=False), until_date=until)
+
+
+async def chat_default_perms(chat_id: int) -> dict:
+    """Права чата по умолчанию как есть (со всеми полями, в том числе новыми)."""
+    chat = await tg_api("getChat", chat_id=chat_id)
+    perms = chat.get("permissions") or {}
+    return {k: v for k, v in perms.items() if isinstance(v, bool)} or dict(DEFAULT_PERMS)
+
+
+async def do_unmute(bot, chat_id: int, uid: int):
+    perms = await chat_default_perms(chat_id)
+    await tg_api("restrictChatMember", chat_id=chat_id, user_id=uid, permissions=perms)
+
+
+async def apply_warn(bot, chat_id: int, uid: int, label: str, reason: str) -> str:
+    """Добавляет предупреждение; на лимите — мут и сброс счётчика. Возвращает текст для чата."""
+    limit = setting(chat_id, "warn_limit")
+    mute_s = setting(chat_id, "warn_mute_h") * 3600
+    n = warns.get((chat_id, uid), 0) + 1
+    if n >= limit:
+        await storage_set_warns(chat_id, uid, 0)
+        try:
+            await do_mute(bot, chat_id, uid, mute_s)
+            return f"🔇 {label}: {n}/{limit} предупреждений ({reason}). Мут на {fmt_duration(mute_s)}."
+        except Exception as e:
+            log.warning("автомут не удался: %s", e)
+            return f"⚠️ {label}: {n}/{limit} предупреждений ({reason}), но замутить не вышло: проверьте права бота."
+    await storage_set_warns(chat_id, uid, n)
+    return f"⚠️ {label}: предупреждение {n}/{limit} ({reason})."
+
+
+async def violation(bot, msg, chat_id: int, user, label: str, reason: str, thread=None):
+    """Нарушение: удаляем сообщение, даём предупреждение, дальше обработчики не идут."""
+    try:
+        await msg.delete()
+    except Exception as e:
+        log.warning("не удалось удалить сообщение (нужно право «Удалять сообщения»): %s", e)
+        raise ApplicationHandlerStop
+    text = await apply_warn(bot, chat_id, user.id, label, reason)
+    await notice(bot, chat_id, text, thread)
+    raise ApplicationHandlerStop
+
+
+async def on_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Проверка каждого сообщения в разрешённых чатах: стоп-слова и ссылки."""
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or user.is_bot or user.id == 777000:
+        return
+    if chat.id not in allowed_chats or msg.sender_chat:
+        return
+    bot = context.bot
+    await track_user(user)  # ник -> ID для /ban @юзер; привязка к долгам и чёрному списку
+    text = msg.text or msg.caption or ""
+    if text.startswith("/"):
+        return
+    label = user_key_label(user)[1]
+    thread = msg.message_thread_id if msg.is_topic_message else None
+
+    # стоп-слова
+    words = stopwords.get(chat.id)
+    if words and text:
+        for w in words:
+            if re.search(r"(?<!\w)" + re.escape(w) + r"(?!\w)", text, re.IGNORECASE):
+                if not await is_exempt(bot, chat.id, user):
+                    await violation(bot, msg, chat.id, user, label, "запрещённое слово", thread)
+                break
+
+    # ссылки
+    if setting(chat.id, "antilink") and has_link(msg) and not link_allowed(chat.id, user):
+        if not await is_exempt(bot, chat.id, user):
+            await violation(bot, msg, chat.id, user, label, "ссылки запрещены", thread)
+
+
+# ---------- команды (админы чата и админы бота, в разрешённых чатах)
+
+def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Кого наказываем: @юзер (если бот его видел) / ID / ответ на сообщение -> (id, подпись, остаток) или None."""
+    args = list(context.args or [])
+    if args:
+        a = args[0]
+        m = re.fullmatch(r"@(\w{3,})", a)
+        if m:
+            uid = seen_users.get(m.group(1).lower())
+            return (uid, "@" + m.group(1), args[1:]) if uid else None
+        if re.fullmatch(r"\d{5,}", a):
+            return int(a), f'<a href="tg://user?id={a}">{a}</a>', args[1:]
+    r = update.effective_message.reply_to_message
+    if r and r.from_user:
+        return r.from_user.id, user_key_label(r.from_user)[1], args
+    return None
+
+
+def resolve_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Для списка «ссылки разрешены»: ID знать не обязательно. -> (ключи, подпись) или None."""
+    args = list(context.args or [])
+    if args:
+        a = args[0]
+        m = re.fullmatch(r"@(\w{3,})", a)
+        if m:
+            keys = ["@" + m.group(1).lower()]
+            uid = seen_users.get(m.group(1).lower())
+            if uid:
+                keys.append(f"id:{uid}")
+            return keys, "@" + m.group(1)
+        if re.fullmatch(r"\d{5,}", a):
+            return [f"id:{a}"], f'<a href="tg://user?id={a}">{a}</a>'
+    r = update.effective_message.reply_to_message
+    if r and r.from_user:
+        keys = [f"id:{r.from_user.id}"]
+        if r.from_user.username:
+            keys.append("@" + r.from_user.username.lower())
+        return keys, user_key_label(r.from_user)[1]
+    return None
+
+
+async def fail(msg, e):
+    await msg.reply_text(
+        "⚠️ Не получилось. Проверьте, что бот — админ группы с правами «Удалять сообщения» "
+        f"и «Блокировать пользователей».\nОшибка: {e}"
+    )
+
+
+@admin_only
+async def cmd_ban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /ban @юзер [время] [причина]\n" + NO_TARGET)
+        return
+    uid, label, rest = t
+    dur, reason = parse_duration(rest)
+    if await is_protected(context.bot, chat_id, uid):
+        await msg.reply_text("Нельзя: это админ или сам бот.")
+        return
+    until = datetime.now(timezone.utc) + timedelta(seconds=dur) if dur else None
+    try:
+        await context.bot.ban_chat_member(chat_id, uid, until_date=until)
+    except Exception as e:
+        await fail(msg, e)
+        return
+    text = f"🚫 {label} забанен" + (f" на {fmt_duration(dur)}" if dur else " навсегда") + "."
+    if reason:
+        text += f"\nПричина: {html.escape(reason)}"
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_unban(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /unban @юзер (или ID)\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    try:
+        await context.bot.unban_chat_member(chat_id, uid, only_if_banned=True)
+    except Exception as e:
+        await fail(msg, e)
+        return
+    await msg.reply_text(f"✅ {label} разбанен.", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_kick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /kick @юзер [причина]\n" + NO_TARGET)
+        return
+    uid, label, rest = t
+    if await is_protected(context.bot, chat_id, uid):
+        await msg.reply_text("Нельзя: это админ или сам бот.")
+        return
+    try:
+        await context.bot.ban_chat_member(chat_id, uid)
+        await context.bot.unban_chat_member(chat_id, uid)  # выгнан, но может вернуться по ссылке
+    except Exception as e:
+        await fail(msg, e)
+        return
+    text = f"👢 {label} исключён из чата."
+    if rest:
+        text += f"\nПричина: {html.escape(' '.join(rest))}"
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /mute @юзер [время: 30м, 2ч, 1д, 1н] [причина]\n" + NO_TARGET)
+        return
+    uid, label, rest = t
+    dur, reason = parse_duration(rest)
+    dur = dur or DEFAULT_MUTE_SECONDS
+    if await is_protected(context.bot, chat_id, uid):
+        await msg.reply_text("Нельзя: это админ или сам бот.")
+        return
+    try:
+        await do_mute(context.bot, chat_id, uid, dur)
+    except Exception as e:
+        await fail(msg, e)
+        return
+    text = f"🔇 {label} в муте на {fmt_duration(dur)}."
+    if reason:
+        text += f"\nПричина: {html.escape(reason)}"
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /unmute @юзер\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    try:
+        await do_unmute(context.bot, chat_id, uid)
+    except Exception as e:
+        await fail(msg, e)
+        return
+    await msg.reply_text(f"🔈 {label} снова может писать.", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_warn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /warn @юзер [причина]\n" + NO_TARGET)
+        return
+    uid, label, rest = t
+    if await is_protected(context.bot, chat_id, uid):
+        await msg.reply_text("Нельзя: это админ или сам бот.")
+        return
+    reason = html.escape(" ".join(rest).strip()) or "нарушение правил"
+    text = await apply_warn(context.bot, chat_id, uid, label, reason)
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_unwarn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /unwarn @юзер\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    n = max(warns.get((chat_id, uid), 0) - 1, 0)
+    await storage_set_warns(chat_id, uid, n)
+    await msg.reply_text(
+        f"✅ У {label} снято предупреждение: {n}/{setting(chat_id, 'warn_limit')}.", parse_mode=ParseMode.HTML
+    )
+
+
+@admin_only
+async def cmd_warns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /warns @юзер\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    await msg.reply_text(
+        f"{label}: предупреждений {warns.get((chat_id, uid), 0)}/{setting(chat_id, 'warn_limit')}.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+# ---------- /free: разрешение на ссылки
+
+@admin_only
+async def cmd_allowlink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/free @юзер — человеку можно отправлять ссылки в этом чате."""
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_keys(update, context)
+    if not t:
+        await msg.reply_text("Использование: /free @юзер (или ответом на сообщение, или ID)")
+        return
+    keys, label = t
+    ok = await storage_allow_link(chat_id, keys, label)
+    text = f"🔗 {label} может отправлять ссылки в этом чате."
+    if not ok:
+        text += "\n⚠️ Не удалось сохранить в базу."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_denylink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/unfree @юзер — снова запретить ссылки."""
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_keys(update, context)
+    if not t:
+        await msg.reply_text("Использование: /unfree @юзер (или ответом на сообщение, или ID)")
+        return
+    keys, label = t
+    ok = await storage_deny_link(chat_id, keys)
+    text = f"⛔ {label} больше не может отправлять ссылки."
+    if not ok:
+        text += "\n⚠️ Не удалось удалить из базы."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_links(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    labels = list(dict.fromkeys(link_allow.get(chat_id, {}).values()))
+    if not labels:
+        await msg.reply_text("Никому не разрешено. Добавить: /free @юзер")
+        return
+    lines = [f"{i}. {lb}" for i, lb in enumerate(labels, 1)]
+    await msg.reply_text("🔗 Могут отправлять ссылки:\n" + "\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_antilink(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    arg = context.args[0].lower() if context.args else ""
+    if arg in ("on", "вкл", "1", "да"):
+        value = True
+    elif arg in ("off", "выкл", "0", "нет"):
+        value = False
+    else:
+        state = "включён ✅" if setting(chat_id, "antilink") else "выключен ⛔"
+        await msg.reply_text(f"Запрет ссылок: {state}\nИзменить: /antilink on или off (или /settings)")
+        return
+    ok = await storage_set_setting(chat_id, "antilink", value)
+    text = f"Запрет ссылок: {'включён ✅' if value else 'выключен ⛔'}"
+    if not ok:
+        text += "\n⚠️ Не удалось сохранить в базу."
+    await msg.reply_text(text)
+
+
+# ---------- стоп-слова
+
+@admin_only
+async def cmd_addword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    first = (msg.text or "").split(None, 1)
+    word = first[1].strip().lower() if len(first) > 1 else ""
+    if not 2 <= len(word) <= 50:
+        await msg.reply_text("Использование: /addword слово (от 2 до 50 символов, можно фразу)")
+        return
+    ok = await storage_add_word(chat_id, word)
+    text = f"🤬 Стоп-слово добавлено: «{html.escape(word)}»"
+    if not ok:
+        text += "\n⚠️ Не удалось сохранить в базу."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_delword(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    first = (msg.text or "").split(None, 1)
+    word = first[1].strip().lower() if len(first) > 1 else ""
+    if not word or word not in stopwords.get(chat_id, []):
+        await msg.reply_text("Такого стоп-слова нет. Список: /words")
+        return
+    ok = await storage_del_word(chat_id, word)
+    text = f"✅ Стоп-слово удалено: «{html.escape(word)}»"
+    if not ok:
+        text += "\n⚠️ Не удалось удалить из базы."
+    await msg.reply_text(text, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_words(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    words = stopwords.get(chat_id, [])
+    if not words:
+        await msg.reply_text("Стоп-слов нет. Добавить: /addword слово")
+        return
+    lines = [f"{i}. {html.escape(w)}" for i, w in enumerate(words, 1)]
+    await msg.reply_text(
+        "🤬 Стоп-слова (сообщение удаляется, автору предупреждение):\n" + "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+    )
+
+
+@admin_only
+async def cmd_protect(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    await msg.reply_text(
+        "🛡 Защита чата\n" + chat_summary(chat_id)
+        + "\n\nМенять настройки удобнее в личке: /settings\nАдмины чата и админы бота под защиту не попадают."
+    )
+
+
+# ---------- теги
+
+def clean_tag(text: str):
+    """Тег / должность: до 16 символов, без эмодзи. -> (текст, ошибка)."""
+    text = text.strip()
+    if len(text) > 16:
+        return None, "Максимум 16 символов."
+    if EMOJI_RX.search(text):
+        return None, "Эмодзи в тегах нельзя."
+    return text, None
+
+
+@admin_only
+async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/tag @юзер текст — тег обычному участнику (рядом с ником в чате)."""
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    tag, err = clean_tag(" ".join(t[2])) if t else (None, None)
+    if not t or not tag or err:
+        await msg.reply_text(
+            "Использование: /tag @юзер текст (до 16 символов, без эмодзи; можно ответом на сообщение)\n"
+            + (err or "") + ("\n" if err else "") + NO_TARGET
+        )
+        return
+    uid, label, _ = t
+    try:
+        await tg_api("setChatMemberTag", chat_id=chat_id, user_id=uid, tag=tag)
+    except Exception as e:
+        await msg.reply_text(
+            "⚠️ Не получилось поставить тег. Боту нужны права админа с пунктом «Управление тегами»; "
+            "тегом помечаются только обычные участники (для админов: /admintag).\n"
+            f"Ошибка: {e}"
+        )
+        return
+    await msg.reply_text(f"🏷 {label}: тег «{html.escape(tag)}».", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_untag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /untag @юзер\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    try:
+        await tg_api("setChatMemberTag", chat_id=chat_id, user_id=uid, tag="")
+    except Exception as e:
+        await msg.reply_text(f"⚠️ Не получилось снять тег: {e}")
+        return
+    await msg.reply_text(f"🏷 У {label} тег снят.", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_admintag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/admintag @юзер текст — должность (тег) админа."""
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    title, err = clean_tag(" ".join(t[2])) if t else (None, None)
+    if not t or not title or err:
+        await msg.reply_text(
+            "Использование: /admintag @юзер текст (до 16 символов, без эмодзи; можно ответом на сообщение)\n"
+            + (err or "") + ("\n" if err else "") + NO_TARGET
+        )
+        return
+    uid, label, _ = t
+    try:
+        await context.bot.set_chat_administrator_custom_title(chat_id, uid, title)
+    except Exception as e:
+        await msg.reply_text(
+            "⚠️ Не получилось. Тег админа ставится только в супергруппах и только админам, "
+            "которых назначил сам бот.\n"
+            f"Ошибка: {e}"
+        )
+        return
+    await msg.reply_text(f"👑 {label}: тег админа «{html.escape(title)}».", parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_unadmintag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg, chat_id = update.effective_message, update.effective_chat.id
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /unadmintag @юзер\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    try:
+        await context.bot.set_chat_administrator_custom_title(chat_id, uid, "")
+    except Exception as e:
+        await msg.reply_text(f"⚠️ Не получилось снять тег админа: {e}")
+        return
+    await msg.reply_text(f"👑 У {label} тег админа снят.", parse_mode=ParseMode.HTML)
+
+
+# ---------- ночной режим
+
+NIGHT_PRESETS = [("22:00", "06:00"), ("23:00", "07:00"), ("00:00", "08:00"), ("01:00", "09:00")]
+TZ_PRESETS = [
+    ("Москва", "Europe/Moscow"), ("Киев", "Europe/Kyiv"), ("Минск", "Europe/Minsk"),
+    ("Екатеринбург", "Asia/Yekaterinburg"), ("Новосибирск", "Asia/Novosibirsk"),
+    ("Владивосток", "Asia/Vladivostok"), ("Алматы", "Asia/Almaty"),
+]
+NIGHT_TIME_RX = re.compile(r"(\d{1,2}):(\d{2})\s*[-–—]\s*(\d{1,2}):(\d{2})")
+OFFSET_RX = re.compile(r"(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?", re.IGNORECASE)
+
+
+def get_tz(name: str):
+    """«Europe/Moscow» или «UTC+3» -> tzinfo (или None, если не понятно)."""
+    name = (name or "").strip()
+    m = OFFSET_RX.fullmatch(name)
+    if m:
+        sign = -1 if m.group(1) == "-" else 1
+        hours, minutes = int(m.group(2)), int(m.group(3) or 0)
+        if hours > 14 or minutes > 59:
+            return None
+        return timezone(sign * timedelta(hours=hours, minutes=minutes))
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return None
+
+
+def norm_tz(name: str) -> str:
+    m = OFFSET_RX.fullmatch(name.strip())
+    if m:
+        return f"UTC{m.group(1)}{int(m.group(2))}" + (f":{m.group(3)}" if m.group(3) and m.group(3) != "00" else "")
+    return name.strip()
+
+
+def chat_tz(chat_id: int):
+    return (
+        get_tz(setting(chat_id, "tz"))
+        or get_tz(DEFAULT_TZ)
+        or timezone(timedelta(hours=3))
+    )
+
+
+def to_minutes(hhmm: str) -> int:
+    h, m = hhmm.split(":")
+    return int(h) * 60 + int(m)
+
+
+def in_night(chat_id: int, now=None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    local = now.astimezone(chat_tz(chat_id))
+    cur = local.hour * 60 + local.minute
+    start, end = to_minutes(setting(chat_id, "night_start")), to_minutes(setting(chat_id, "night_end"))
+    if start == end:
+        return False
+    if start < end:
+        return start <= cur < end
+    return cur >= start or cur < end  # ночь через полночь, например 23:00–07:00
+
+
+async def night_lock(bot, chat_id: int):
+    """Закрывает чат: обычным участникам нельзя писать, админы пишут как обычно."""
+    saved = await chat_default_perms(chat_id)
+    locked = {
+        k: (False if k.startswith("can_send_") or k == "can_add_web_page_previews" else v)
+        for k, v in saved.items()
+    }
+    # сначала запоминаем, как было, чтобы после перезапуска бота вернуть всё обратно
+    chat_settings.setdefault(chat_id, {}).update(night_locked=True, night_perms=saved)
+    await storage_save_cfg(chat_id)
+    try:
+        await tg_api("setChatPermissions", chat_id=chat_id, permissions=locked)
+    except Exception:
+        chat_settings[chat_id].update(night_locked=False, night_perms=None)
+        await storage_save_cfg(chat_id)
+        raise
+    await bot.send_message(
+        chat_id, f"🌙 Ночной режим: чат закрыт до {setting(chat_id, 'night_end')}. Админы могут писать."
+    )
+
+
+async def night_unlock(bot, chat_id: int):
+    saved = setting(chat_id, "night_perms") or dict(DEFAULT_PERMS)
+    await tg_api("setChatPermissions", chat_id=chat_id, permissions=saved)
+    chat_settings.setdefault(chat_id, {}).update(night_locked=False, night_perms=None)
+    await storage_save_cfg(chat_id)
+    await bot.send_message(chat_id, "☀️ Ночной режим закончился — чат снова открыт.")
+
+
+async def night_check(bot, chat_id: int):
+    want = setting(chat_id, "night") and in_night(chat_id)
+    locked = setting(chat_id, "night_locked")
+    if want and not locked:
+        await night_lock(bot, chat_id)
+    elif locked and not want:
+        await night_unlock(bot, chat_id)
+
+
+async def night_loop(bot):
+    """Каждые 30 секунд проверяет, не пора ли закрыть или открыть чаты."""
+    while True:
+        for chat_id in list(allowed_chats):
+            if not (setting(chat_id, "night") or setting(chat_id, "night_locked")):
+                continue
+            if time.monotonic() < night_retry_at.get(chat_id, 0):
+                continue
+            try:
+                await night_check(bot, chat_id)
+            except Exception as e:
+                log.warning("ночной режим в чате %s: %s", chat_id, e)
+                night_retry_at[chat_id] = time.monotonic() + 600  # не долбим API, повтор через 10 минут
+                try:
+                    await bot.send_message(
+                        chat_id,
+                        "⚠️ Ночной режим не сработал. Боту нужны права админа «Блокировать пользователей» "
+                        "(менять права чата).",
+                    )
+                except Exception:
+                    pass
+        await asyncio.sleep(30)
+
+
+# ---------- настройки в личке (/settings)
+
+def btn(text: str, data: str):
+    return InlineKeyboardButton(text, callback_data=data)
+
+
+def onoff(b) -> str:
+    return "вкл ✅" if b else "выкл ⛔"
+
+
+def cfg_title(chat_id: int) -> str:
+    return html.escape(allowed_chats.get(chat_id, str(chat_id)))
+
+
+def mark(b) -> str:
+    return "✅" if b else "⛔"
+
+
+def footer(c: int, back=None) -> list:
+    """Нижний ряд кнопок: «Назад» (если есть куда) и «Закрыть»."""
+    row = []
+    if back:
+        row.append(btn("◀️ Назад", f"cfg:{c}:{back}"))
+    row.append(btn("✅ Закрыть", f"cfg:{c}:close"))
+    return row
+
+
+def chat_summary(chat_id: int) -> str:
+    s = lambda n: setting(chat_id, n)
+    people = len(set(link_allow.get(chat_id, {}).values()))
+    return (
+        f"🔗 Запрет ссылок: {onoff(s('antilink'))} (разрешено людям: {people})\n"
+        f"🌙 Ночной режим: {onoff(s('night'))} ({s('night_start')}–{s('night_end')}, {html.escape(str(s('tz')))})\n"
+        f"⚠️ Предупреждения: {s('warn_limit')} → мут на {fmt_duration(s('warn_mute_h') * 3600)}\n"
+        f"🔤 Запрещённых слов: {len(stopwords.get(chat_id, []))}"
+    )
+
+
+def main_menu(chat_id: int):
+    c = chat_id
+    text = (
+        f"⚙️ <b>Группа: {cfg_title(c)}</b>\n\n{chat_summary(c)}\n\n"
+        "Выберите один из параметров, который вы хотите изменить."
+    )
+    rows = [
+        [btn(f"🔗 Ссылки {mark(setting(c, 'antilink'))}", f"cfg:{c}:lk"),
+         btn(f"🌙 Ночной режим {mark(setting(c, 'night'))}", f"cfg:{c}:nm")],
+        [btn("⚠️ Предупреждения", f"cfg:{c}:wm"), btn("🔤 Запрещённые слова", f"cfg:{c}:wd")],
+        [btn("🔓 Разрешения", f"cfg:{c}:fr"), btn("👥 Пользователи", f"cfg:{c}:um")],
+        [btn("💬 Другой чат", "cfg:0:chats")],
+        [btn("✅ Закрыть", f"cfg:{c}:close"), btn("▶️ Другие", f"cfg:{c}:more")],
+    ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def more_menu(chat_id: int):
+    c = chat_id
+    rows = [
+        [btn("📖 Команды защитника", f"cfg:{c}:cm")],
+        [btn("🏷 Теги и должности", f"cfg:{c}:tgs")],
+        footer(c, "menu"),
+    ]
+    return f"▶️ <b>Другие параметры: {cfg_title(c)}</b>\n\nВыберите один из параметров.", InlineKeyboardMarkup(rows)
+
+
+def links_menu(chat_id: int):
+    c = chat_id
+    on = setting(c, "antilink")
+    people = len(set(link_allow.get(c, {}).values()))
+    text = (
+        f"🔗 <b>Ссылки</b>\nЗапрет ссылок: {onoff(on)}\n\n"
+        "Сообщения со ссылками (http, www, t.me, ссылки в тексте и подписях) удаляются, автор получает "
+        "предупреждение. Админы и люди из списка «Разрешения» могут отправлять ссылки.\n"
+        f"Разрешено людям: {people}"
+    )
+    rows = [
+        [btn(f"Запрет ссылок: {onoff(on)}", f"cfg:{c}:al")],
+        [btn("🔓 Разрешения", f"cfg:{c}:fr")],
+        footer(c, "menu"),
+    ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def night_menu(chat_id: int):
+    c = chat_id
+    on, locked = setting(c, "night"), setting(c, "night_locked")
+    text = (
+        f"🌙 <b>Ночной режим</b>\nСейчас: {onoff(on)}\n"
+        f"Время: {setting(c, 'night_start')}–{setting(c, 'night_end')} ({html.escape(str(setting(c, 'tz')))})\n"
+        f"Чат сейчас: {'закрыт 🔒' if locked else 'открыт'}\n\n"
+        "В ночное время обычным участникам нельзя писать, админы пишут как обычно. "
+        "Утром бот возвращает права чата как были.\nБоту нужно право админа «Блокировать пользователей»."
+    )
+    rows = [
+        [btn(f"Ночной режим: {onoff(on)}", f"cfg:{c}:nt")],
+        [btn("🕒 Время ночи", f"cfg:{c}:ntm"), btn("🌍 Часовой пояс", f"cfg:{c}:tzm")],
+        footer(c, "menu"),
+    ]
+    return text, InlineKeyboardMarkup(rows)
+
+
+def night_time_menu(chat_id: int):
+    cur = (setting(chat_id, "night_start"), setting(chat_id, "night_end"))
+    rows = []
+    for i, (a, b) in enumerate(NIGHT_PRESETS):
+        rows.append([btn(("✓ " if (a, b) == cur else "") + f"{a} – {b}", f"cfg:{chat_id}:nts:{i}")])
+    rows.append([btn("✏️ Своё время", f"cfg:{chat_id}:ntc")])
+    rows.append(footer(chat_id, "nm"))
+    text = (
+        f"🕒 <b>Время ночного режима</b>\nСейчас: {cur[0]}–{cur[1]} ({html.escape(str(setting(chat_id, 'tz')))})"
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def tz_menu(chat_id: int):
+    cur = setting(chat_id, "tz")
+    rows = []
+    for i in range(0, len(TZ_PRESETS), 2):
+        row = []
+        for j in (i, i + 1):
+            if j < len(TZ_PRESETS):
+                name, tz = TZ_PRESETS[j]
+                row.append(btn(("✓ " if tz == cur else "") + name, f"cfg:{chat_id}:tz:{j}"))
+        rows.append(row)
+    rows.append([btn("✏️ Свой пояс", f"cfg:{chat_id}:tzc")])
+    rows.append(footer(chat_id, "nm"))
+    return f"🌍 <b>Часовой пояс</b>\nСейчас: {html.escape(str(cur))}", InlineKeyboardMarkup(rows)
+
+
+def warn_menu(chat_id: int):
+    lim, hrs = setting(chat_id, "warn_limit"), setting(chat_id, "warn_mute_h")
+    limits = [btn(("✓ " if n == lim else "") + str(n), f"cfg:{chat_id}:wl:{n}") for n in (2, 3, 5)]
+    mutes = [btn(("✓ " if h == hrs else "") + fmt_duration(h * 3600), f"cfg:{chat_id}:wh:{h}") for h in (1, 6, 24, 72)]
+    rows = [limits, mutes, footer(chat_id, "menu")]
+    text = (
+        "⚠️ <b>Предупреждения</b>\n"
+        f"Сколько предупреждений до мута: {lim}\nНа сколько мут: {fmt_duration(hrs * 3600)}\n\n"
+        "Первая строка кнопок — лимит, вторая — длительность мута."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def words_menu(chat_id: int):
+    words = stopwords.get(chat_id, [])
+    rows = [[btn(f"❌ {w[:30]}", f"cfg:{chat_id}:dw:{i}")] for i, w in enumerate(words[:30])]
+    rows.append([btn("➕ Добавить слово", f"cfg:{chat_id}:aw")])
+    rows.append(footer(chat_id, "menu"))
+    text = "🔤 <b>Запрещённые слова</b>\n" + (
+        "Нажмите на слово, чтобы удалить.\n" if words else "Пока пусто.\n"
+    ) + "Сообщение с таким словом удаляется, автор получает предупреждение."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def free_labels(chat_id: int) -> list:
+    return list(dict.fromkeys(link_allow.get(chat_id, {}).values()))
+
+
+def free_menu(chat_id: int):
+    labels = free_labels(chat_id)
+    rows = [[btn(f"❌ {re.sub('<[^>]+>', '', lb)[:30]}", f"cfg:{chat_id}:uf:{i}")] for i, lb in enumerate(labels[:30])]
+    rows.append(footer(chat_id, "menu"))
+    text = "🔓 <b>Разрешения: кому можно ссылки</b>\n" + (
+        "Нажмите на человека, чтобы убрать разрешение." if labels else "Пока никому."
+    ) + "\nДобавить: в чате команда /free @юзер (или ответом на сообщение)."
+    return text, InlineKeyboardMarkup(rows)
+
+
+def warned_users(chat_id: int) -> list:
+    items = [(uid, n) for (cid, uid), n in warns.items() if cid == chat_id and n > 0]
+    items.sort(key=lambda x: (-x[1], x[0]))
+    return items[:20]
+
+
+def user_name(uid: int) -> str:
+    for name, i in seen_users.items():
+        if i == uid:
+            return "@" + name
+    return str(uid)
+
+
+def users_menu(chat_id: int):
+    items = warned_users(chat_id)
+    lim = setting(chat_id, "warn_limit")
+    rows = [[btn(f"❌ {user_name(uid)} — {n}/{lim}", f"cfg:{chat_id}:uw:{i}")] for i, (uid, n) in enumerate(items)]
+    rows.append(footer(chat_id, "menu"))
+    text = (
+        "👥 <b>Пользователи</b>\n"
+        + ("С предупреждениями (нажмите, чтобы снять все):" if items else "Сейчас ни у кого нет предупреждений.")
+        + "\n\nБан, мут и предупреждения выдаются в чате командами (ответом на сообщение или @юзер): "
+        "/ban, /unban, /kick, /mute, /unmute, /warn, /unwarn, /warns."
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+def commands_menu(chat_id: int):
+    text = (
+        "📖 <b>Команды защитника</b> (админы чата, в группе)\n\n"
+        "🔓 /free @юзер — разрешить ссылки, /unfree — запретить, /links — список\n"
+        "🚫 /ban, /unban, /kick @юзер [время] [причина]\n"
+        "🔇 /mute @юзер [30м, 2ч, 1д, 1н], /unmute\n"
+        "⚠️ /warn, /unwarn, /warns @юзер\n"
+        "🔤 /addword, /delword, /words\n"
+        "🏷 /tag, /untag, /admintag, /unadmintag\n"
+        "⚙️ /settings — это меню\n\n"
+        "@юзер работает, если бот уже видел сообщения человека; иначе ответьте командой на его сообщение или укажите ID."
+    )
+    return text, InlineKeyboardMarkup([footer(chat_id, "more")])
+
+
+def tags_menu(chat_id: int):
+    text = (
+        "🏷 <b>Теги и должности</b>\n\n"
+        "/tag @юзер текст — тег обычному участнику, /untag — снять. Боту нужно право админа «Управление тегами».\n"
+        "/admintag @юзер текст — должность админа, /unadmintag — снять. Работает только в супергруппах и только "
+        "для админов, которых назначил сам бот.\n\n"
+        "Текст до 16 символов, без эмодзи. Можно ответом на сообщение."
+    )
+    return text, InlineKeyboardMarkup([footer(chat_id, "more")])
+
+
+async def can_manage(bot, chat_id: int, user) -> bool:
+    """Настройки чата: админы бота и админы этого чата."""
+    if chat_id not in allowed_chats:
+        return False
+    if user.id in ADMIN_IDS:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id, user.id)
+        return member.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+    except Exception:
+        return False
+
+
+async def chats_menu(bot, user):
+    chats = [cid for cid in list(allowed_chats) if await can_manage(bot, cid, user)]
+    if not chats:
+        return "У вас нет прав админа ни в одном из чатов, где работает бот.", None
+    rows = [[btn(f"💬 {allowed_chats[cid][:40]}", f"cfg:{cid}:menu")] for cid in chats[:50]]
+    return "⚙️ <b>Настройки</b>\nВыберите чат:", InlineKeyboardMarkup(rows)
+
+
+async def show_menu(q, text, markup):
+    try:
+        await q.edit_message_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            raise
+
+
+async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, msg, user = update.effective_chat, update.effective_message, update.effective_user
+    if chat.type == ChatType.PRIVATE:
+        text, markup = await chats_menu(context.bot, user)
+        await msg.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=markup)
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or chat.id not in allowed_chats:
+        return
+    if not await is_admin(update, context):
+        return
+    link = f"https://t.me/{context.bot.username}?start=cfg_{chat.id}"
+    await msg.reply_text(
+        "Настройки этого чата открываются в личке с ботом.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Открыть настройки", url=link)]]),
+    )
+
+
+async def on_cfg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    m = re.fullmatch(r"cfg:(-?\d+):(\w+)(?::(\d+))?", q.data or "")
+    if not m:
+        await q.answer()
+        return
+    chat_id, action, arg = int(m.group(1)), m.group(2), m.group(3)
+    user, bot = q.from_user, context.bot
+
+    if action == "chats":
+        text, markup = await chats_menu(bot, user)
+        await q.answer()
+        await show_menu(q, text, markup)
+        return
+    if not await can_manage(bot, chat_id, user):
+        await q.answer("Нет доступа к настройкам этого чата.", show_alert=True)
+        return
+    if action == "close":
+        await q.answer()
+        try:
+            await q.message.delete()
+        except Exception:
+            await show_menu(q, "Настройки закрыты. Открыть снова: /settings", None)
+        return
+
+    note = None
+    view = main_menu
+    if action == "lk":
+        view = links_menu
+    elif action == "al":
+        await storage_set_setting(chat_id, "antilink", not setting(chat_id, "antilink"))
+        view = links_menu
+    elif action == "nm":
+        view = night_menu
+    elif action == "nt":
+        await storage_set_setting(chat_id, "night", not setting(chat_id, "night"))
+        try:
+            await night_check(bot, chat_id)
+        except Exception as e:
+            note = f"Не удалось закрыть/открыть чат: нужны права админа «Блокировать пользователей». ({e})"
+        view = night_menu
+    elif action == "ntm":
+        view = night_time_menu
+    elif action == "nts" and arg is not None and int(arg) < len(NIGHT_PRESETS):
+        start, end = NIGHT_PRESETS[int(arg)]
+        chat_settings.setdefault(chat_id, {}).update(night_start=start, night_end=end)
+        await storage_save_cfg(chat_id)
+        try:
+            await night_check(bot, chat_id)
+        except Exception as e:
+            note = f"Не удалось закрыть/открыть чат: {e}"
+        view = night_time_menu
+    elif action == "ntc":
+        dm_input[user.id] = {"chat_id": chat_id, "action": "nighttime", "ts": time.monotonic()}
+        await q.answer()
+        await show_menu(
+            q, "✏️ Отправьте время ночного режима сообщением, например: <code>23:30-07:00</code>\n"
+            "(или «отмена»)", InlineKeyboardMarkup([[btn("◀️ Назад", f"cfg:{chat_id}:ntm")]]),
+        )
+        return
+    elif action == "tzm":
+        view = tz_menu
+    elif action == "tz" and arg is not None and int(arg) < len(TZ_PRESETS):
+        await storage_set_setting(chat_id, "tz", TZ_PRESETS[int(arg)][1])
+        try:
+            await night_check(bot, chat_id)
+        except Exception as e:
+            note = f"Не удалось закрыть/открыть чат: {e}"
+        view = tz_menu
+    elif action == "tzc":
+        dm_input[user.id] = {"chat_id": chat_id, "action": "tz", "ts": time.monotonic()}
+        await q.answer()
+        await show_menu(
+            q, "✏️ Отправьте часовой пояс сообщением: например <code>Asia/Tashkent</code> или <code>UTC+5</code>\n"
+            "(или «отмена»)", InlineKeyboardMarkup([[btn("◀️ Назад", f"cfg:{chat_id}:tzm")]]),
+        )
+        return
+    elif action == "wm":
+        view = warn_menu
+    elif action == "wl" and arg in ("2", "3", "5"):
+        await storage_set_setting(chat_id, "warn_limit", int(arg))
+        view = warn_menu
+    elif action == "wh" and arg in ("1", "6", "24", "72"):
+        await storage_set_setting(chat_id, "warn_mute_h", int(arg))
+        view = warn_menu
+    elif action == "wd":
+        view = words_menu
+    elif action == "dw" and arg is not None:
+        words = stopwords.get(chat_id, [])
+        if int(arg) < len(words):
+            await storage_del_word(chat_id, words[int(arg)])
+        view = words_menu
+    elif action == "aw":
+        dm_input[user.id] = {"chat_id": chat_id, "action": "addword", "ts": time.monotonic()}
+        await q.answer()
+        await show_menu(
+            q, "✏️ Отправьте стоп-слово или фразу сообщением (или «отмена»).",
+            InlineKeyboardMarkup([[btn("◀️ Назад", f"cfg:{chat_id}:wd")]]),
+        )
+        return
+    elif action == "fr":
+        view = free_menu
+    elif action == "uf" and arg is not None:
+        labels = free_labels(chat_id)
+        if int(arg) < len(labels):
+            keys = [k for k, lb in link_allow.get(chat_id, {}).items() if lb == labels[int(arg)]]
+            await storage_deny_link(chat_id, keys)
+        view = free_menu
+    elif action == "um":
+        view = users_menu
+    elif action == "uw" and arg is not None:
+        items = warned_users(chat_id)
+        if int(arg) < len(items):
+            await storage_set_warns(chat_id, items[int(arg)][0], 0)
+        view = users_menu
+    elif action == "more":
+        view = more_menu
+    elif action == "cm":
+        view = commands_menu
+    elif action == "tgs":
+        view = tags_menu
+    elif action != "menu":
+        await q.answer()
+        return
+
+    text, markup = view(chat_id)
+    if note:
+        text += f"\n\n⚠️ {html.escape(note)}"
+    await q.answer()
+    await show_menu(q, text, markup)
+
+
+async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ответ админа на вопрос меню настроек (своё время, пояс, стоп-слово). Иначе бот молчит."""
+    msg, user = update.effective_message, update.effective_user
+    st = dm_input.get(user.id)
+    if not st:
+        return
+    if time.monotonic() - st["ts"] > 600:
+        dm_input.pop(user.id, None)
+        return
+    chat_id, action = st["chat_id"], st["action"]
+    text = (msg.text or "").strip()
+    if text.lower() in ("отмена", "cancel"):
+        dm_input.pop(user.id, None)
+        await msg.reply_text("Отменено.")
+        return
+    if not await can_manage(context.bot, chat_id, user):
+        dm_input.pop(user.id, None)
+        return
+    note = None
+    if action == "addword":
+        word = text.lower()
+        if not 2 <= len(word) <= 50:
+            await msg.reply_text("Нужно от 2 до 50 символов. Попробуйте ещё раз или напишите «отмена».")
+            return
+        await storage_add_word(chat_id, word)
+    elif action == "nighttime":
+        m = NIGHT_TIME_RX.fullmatch(text)
+        if not m or int(m.group(1)) > 23 or int(m.group(3)) > 23 or int(m.group(2)) > 59 or int(m.group(4)) > 59:
+            await msg.reply_text("Не понял. Формат: 23:30-07:00. Попробуйте ещё раз или напишите «отмена».")
+            return
+        start = f"{int(m.group(1)):02d}:{m.group(2)}"
+        end = f"{int(m.group(3)):02d}:{m.group(4)}"
+        chat_settings.setdefault(chat_id, {}).update(night_start=start, night_end=end)
+        await storage_save_cfg(chat_id)
+    elif action == "tz":
+        if get_tz(text) is None:
+            await msg.reply_text("Не знаю такой пояс. Примеры: Europe/Moscow, Asia/Tashkent, UTC+5. Или «отмена».")
+            return
+        await storage_set_setting(chat_id, "tz", norm_tz(text))
+    dm_input.pop(user.id, None)
+    if action in ("nighttime", "tz"):
+        try:
+            await night_check(context.bot, chat_id)
+        except Exception as e:
+            note = f"Не удалось закрыть/открыть чат: {e}"
+    view = words_menu if action == "addword" else night_menu
+    mtext, markup = view(chat_id)
+    if note:
+        mtext += f"\n\n⚠️ {html.escape(note)}"
+    await msg.reply_text("✅ Готово.\n\n" + mtext, parse_mode=ParseMode.HTML, reply_markup=markup)
+
+
 # ---------------------------------------------------------------- управление чатами (лс)
 
 def bot_admin_private(func):
@@ -1364,7 +2793,8 @@ async def on_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     user = q.from_user
     key, label = user_key_label(user)
-    if key in blacklist:
+    await track_user(user)
+    if black_entry(key, user.id):
         await q.answer(black_message(label, True), show_alert=True)
         return
 
@@ -1419,7 +2849,7 @@ async def roulette_text(update, context, game, text):
         key, label = "@" + name.lower(), "@" + name
     else:
         key, label = user_key_label(msg.from_user)
-    if key in blacklist:
+    if black_entry(key, self_uid(msg.from_user, key)):
         own = key == user_key_label(msg.from_user)[0]
         await msg.reply_text(black_message(label, own), parse_mode=ParseMode.HTML)
         return
@@ -1452,7 +2882,7 @@ async def bingo_text(update, context, game, text):
     # числа без «@»: после кнопки или ответом на сообщение бота
     if all(is_num(t) for t in tokens) and (uid in pending or to_bot):
         key, label = user_key_label(user)
-        if key in blacklist:
+        if black_entry(key, user.id):
             pending.discard(uid)
             await msg.reply_text(black_message(label, True), parse_mode=ParseMode.HTML)
             return
@@ -1501,7 +2931,7 @@ async def bingo_text(update, context, game, text):
     if not rest:
         if name:
             return  # "@юзер" без чисел игнорируем
-        if key in blacklist:
+        if black_entry(key, user.id):
             await msg.reply_text(black_message(label, True), parse_mode=ParseMode.HTML)
             return
         if key in game["banned"]:
@@ -1514,7 +2944,7 @@ async def bingo_text(update, context, game, text):
         await prompt_numbers(context, chat_id, user, game)
         return
 
-    if key in blacklist:
+    if black_entry(key, self_uid(user, key)):
         own = key == user_key_label(user)[0]
         await msg.reply_text(black_message(label, own), parse_mode=ParseMode.HTML)
         return
@@ -1624,11 +3054,34 @@ async def main():
     app.add_handler(CommandHandler("atrigger", cmd_atrigger))
     app.add_handler(CommandHandler("dtrigger", cmd_dtrigger))
     app.add_handler(CommandHandler("triggers", cmd_triggers))
+    app.add_handler(CommandHandler("ban", cmd_ban))
+    app.add_handler(CommandHandler("unban", cmd_unban))
+    app.add_handler(CommandHandler("kick", cmd_kick))
+    app.add_handler(CommandHandler("mute", cmd_mute))
+    app.add_handler(CommandHandler("unmute", cmd_unmute))
+    app.add_handler(CommandHandler("warn", cmd_warn))
+    app.add_handler(CommandHandler("unwarn", cmd_unwarn))
+    app.add_handler(CommandHandler("warns", cmd_warns))
+    app.add_handler(CommandHandler("free", cmd_allowlink))
+    app.add_handler(CommandHandler(["unfree", "denylink"], cmd_denylink))
+    app.add_handler(CommandHandler("links", cmd_links))
+    app.add_handler(CommandHandler("antilink", cmd_antilink))
+    app.add_handler(CommandHandler("addword", cmd_addword))
+    app.add_handler(CommandHandler("delword", cmd_delword))
+    app.add_handler(CommandHandler("words", cmd_words))
+    app.add_handler(CommandHandler("protect", cmd_protect))
+    app.add_handler(CommandHandler("settings", cmd_settings))
+    app.add_handler(CommandHandler("tag", cmd_tag))
+    app.add_handler(CommandHandler("untag", cmd_untag))
+    app.add_handler(CommandHandler("admintag", cmd_admintag))
+    app.add_handler(CommandHandler("unadmintag", cmd_unadmintag))
     app.add_handler(CommandHandler("addchat", cmd_addchat))
     app.add_handler(CommandHandler("delchat", cmd_delchat))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CallbackQueryHandler(on_join, pattern="^join$"))
     app.add_handler(CallbackQueryHandler(on_trigger_choice, pattern="^tg:"))
+    app.add_handler(CallbackQueryHandler(on_cfg, pattern="^cfg:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_private_text))
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, on_group_text)
     )
@@ -1641,6 +3094,9 @@ async def main():
         ),
         group=1,
     )
+
+    # защитник: проверка флуда, стоп-слов и ссылок — раньше игр и триггеров
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS, on_moderation), group=-1)
 
     # веб-сервер поднимаем первым, чтобы Render сразу увидел открытый порт
     web_app = web.Application()
@@ -1656,11 +3112,13 @@ async def main():
         await app.start()
         await app.updater.start_polling(drop_pending_updates=True)
         ping_task = asyncio.create_task(self_ping())
+        night_task = asyncio.create_task(night_loop(app.bot))
         log.info("Бот запущен")
         try:
             await asyncio.Event().wait()
         finally:
             ping_task.cancel()
+            night_task.cancel()
             await app.updater.stop()
             await app.stop()
             await runner.cleanup()
