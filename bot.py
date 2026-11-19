@@ -82,11 +82,16 @@ DEFAULT_SETTINGS = {
     "night_perms": None,  # права чата до закрытия (чтобы вернуть как было)
     "warn_limit": WARN_LIMIT,
     "warn_mute_h": WARN_MUTE_HOURS,
+    "nickwatch": True,  # сообщать в чат о смене ника
 }
 # предупреждения: (chat_id, user_id) -> количество
 warns: dict[tuple[int, int], int] = {}
 # username (в нижнем регистре) -> user_id: нужно, чтобы работали /ban @юзер и т. п.
 seen_users: dict[str, int] = {}
+# как человека зовут сейчас и раньше: user_id -> {"username", "name", "hist": [строки]}
+known_names: dict[int, dict] = {}
+# смена ника, о которой ещё не сообщили в некоторых чатах: user_id -> {"old", "new", "chats"}
+name_pending: dict[int, dict] = {}
 admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
 # ждём ответ от админа в личке (своё время ночи, часовой пояс, новое стоп-слово)
 dm_input: dict[int, dict] = {}
@@ -137,6 +142,8 @@ def load_file():
         for k, n in d.get("warns", {}).items():
             c, u = k.split(":")
             warns[(int(c), int(u))] = n
+        for k, v in d.get("names", {}).items():
+            known_names[int(k)] = v
     except FileNotFoundError:
         pass
     except Exception as e:
@@ -159,6 +166,7 @@ def save_file():
                     "stopwords": {str(c): w for c, w in stopwords.items()},
                     "chat_settings": {str(c): st for c, st in chat_settings.items()},
                     "warns": {f"{c}:{u}": n for (c, u), n in warns.items()},
+                    "names": {str(k): v for k, v in known_names.items()},
                 },
                 f,
                 ensure_ascii=False,
@@ -204,7 +212,9 @@ async def init_storage():
                 "CREATE TABLE IF NOT EXISTS chat_cfg (chat_id BIGINT PRIMARY KEY, data TEXT NOT NULL);"
                 "CREATE TABLE IF NOT EXISTS warns (chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL,"
                 " cnt INT NOT NULL, PRIMARY KEY (chat_id, user_id));"
-                "CREATE TABLE IF NOT EXISTS seen_users (username TEXT PRIMARY KEY, user_id BIGINT NOT NULL)"
+                "CREATE TABLE IF NOT EXISTS seen_users (username TEXT PRIMARY KEY, user_id BIGINT NOT NULL);"
+                "CREATE TABLE IF NOT EXISTS user_names (user_id BIGINT PRIMARY KEY, username TEXT,"
+                " name TEXT NOT NULL DEFAULT '', hist TEXT NOT NULL DEFAULT '[]')"
             )
             for r in await c.fetch("SELECT chat_id, title FROM chats"):
                 allowed_chats[r["chat_id"]] = r["title"]
@@ -237,6 +247,10 @@ async def init_storage():
                 warns[(r["chat_id"], r["user_id"])] = r["cnt"]
             for r in await c.fetch("SELECT username, user_id FROM seen_users"):
                 seen_users[r["username"]] = r["user_id"]
+            for r in await c.fetch("SELECT user_id, username, name, hist FROM user_names"):
+                known_names[r["user_id"]] = {
+                    "username": r["username"], "name": r["name"], "hist": json.loads(r["hist"]),
+                }
         log.info(
             "База подключена: чатов %d, топов %d, долгов %d, в черном списке %d",
             len(allowed_chats), len(perm_tops), len(debts), len(blacklist),
@@ -526,6 +540,68 @@ def is_num(token: str) -> bool:
 def is_top(game, key: str) -> bool:
     """Топ: постоянный (/top) или на эту игру (/vtop)."""
     return key in perm_tops or key in game["vtops"]
+
+
+def fmt_user(username) -> str:
+    return f"@{username}" if username else "нет"
+
+
+async def storage_save_name(uid: int) -> bool:
+    rec = known_names[uid]
+    return await db_exec(
+        "INSERT INTO user_names (user_id, username, name, hist) VALUES ($1, $2, $3, $4) "
+        "ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, name = EXCLUDED.name, "
+        "hist = EXCLUDED.hist",
+        uid,
+        rec["username"],
+        rec["name"],
+        json.dumps(rec["hist"], ensure_ascii=False),
+    )
+
+
+def name_change_text(uid: int, old: dict, new_u, new_n: str) -> str:
+    lines = [
+        "🔄 <b>Смена ника</b>",
+        f'👤 <a href="tg://user?id={uid}">{html.escape(new_n)}</a> (ID <code>{uid}</code>)',
+    ]
+    if old["username"] != new_u:
+        lines.append(f"Юзернейм: {fmt_user(old['username'])} → {fmt_user(new_u)}")
+    if old["name"] != new_n:
+        lines.append(f"Имя: {html.escape(old['name'])} → {html.escape(new_n)}")
+    return "\n".join(lines)
+
+
+async def check_name_change(bot, chat_id: int, user, thread=None):
+    """Замечает смену юзернейма/имени и сообщает об этом в чат (в каждом чате, где человек пишет)."""
+    cur_u, cur_n = user.username, user.full_name
+    rec = known_names.get(user.id)
+    if rec is None:  # видим человека впервые — просто запоминаем
+        known_names[user.id] = {"username": cur_u, "name": cur_n, "hist": []}
+        await storage_save_name(user.id)
+        return
+    if rec["username"] != cur_u or rec["name"] != cur_n:
+        old = {"username": rec["username"], "name": rec["name"]}
+        today = datetime.now(get_tz(DEFAULT_TZ) or timezone.utc).strftime("%d.%m.%Y")
+        rec["hist"] = ([f"{today}: {fmt_user(old['username'])} · {old['name']}"] + rec["hist"])[:10]
+        rec["username"], rec["name"] = cur_u, cur_n
+        await storage_save_name(user.id)
+        # сообщить нужно в каждом чате, где этот человек потом напишет
+        name_pending[user.id] = {"old": old, "new": (cur_u, cur_n), "chats": set(allowed_chats)}
+    p = name_pending.get(user.id)
+    if p and chat_id in p["chats"]:
+        p["chats"].discard(chat_id)
+        if not p["chats"]:
+            name_pending.pop(user.id, None)
+        if setting(chat_id, "nickwatch"):
+            try:
+                await bot.send_message(
+                    chat_id,
+                    name_change_text(user.id, p["old"], *p["new"]),
+                    parse_mode=ParseMode.HTML,
+                    message_thread_id=thread,
+                )
+            except Exception as e:
+                log.warning("не удалось сообщить о смене ника: %s", e)
 
 
 def key_uid(key: str):
@@ -864,17 +940,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет доступа к настройкам этого чата.")
         return
     await update.message.reply_text(
-        "Привет! Я бот для игр и защиты группы. Игры запускают админы командами /roulette и /bingo, "
+        "Привет! Я бот для игр и защиты группы. Игры запускают админы командой /games, "
         "настройки чата открываются здесь: /settings."
     )
 
 
-async def start_game(update: Update, kind: str):
-    chat_id = update.effective_chat.id
-    if chat_id in games:
-        await update.effective_message.reply_text("Игра уже идёт. Завершить: /stopgame")
-        return
-    game = {
+GAME_NAMES = {"bingo": "🎯 Бинго", "roulette": "🎰 Рулетка"}
+
+
+def new_game(kind: str) -> dict:
+    return {
         "type": kind,
         "closed": False,
         "players": {},
@@ -885,19 +960,56 @@ async def start_game(update: Update, kind: str):
         "banned": set(),
         "vtops": set(),  # топы только на эту игру
     }
-    games[chat_id] = game
-    m = await update.effective_message.reply_text(
-        render(game), parse_mode=ParseMode.HTML, reply_markup=keyboard(game)
-    )
-    game["msg_id"] = m.message_id
 
 
 @admin_only
-async def cmd_roulette(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await start_game(update, "roulette")
+async def cmd_games(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/games — выбор игры кнопками."""
+    chat_id = update.effective_chat.id
+    game = games.get(chat_id)
+    if game:
+        await update.effective_message.reply_text(
+            f"Сейчас идёт игра: {GAME_NAMES[game['type']]}. Завершить: /stopgame"
+        )
+        return
+    kb = InlineKeyboardMarkup([
+        [btn("🎯 Бинго", "game:bingo"), btn("🎰 Рулетка", "game:roulette")],
+        [btn("✖️ Отмена", "game:cancel")],
+    ])
+    await update.effective_message.reply_text("🎮 Выберите игру:", reply_markup=kb)
+
+
+async def on_game_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Нажатие на игру в /games: это же сообщение превращается в список записи."""
+    q = update.callback_query
+    chat_id = q.message.chat_id
+    m = re.fullmatch(r"game:(bingo|roulette|cancel)", q.data or "")
+    if not m or chat_id not in allowed_chats:
+        await q.answer()
+        return
+    if not await can_manage(context.bot, chat_id, q.from_user):
+        await q.answer("Игры запускают только админы.", show_alert=True)
+        return
+    kind = m.group(1)
+    if kind == "cancel":
+        await q.answer()
+        try:
+            await q.message.delete()
+        except Exception:
+            await q.edit_message_text("Отменено.")
+        return
+    if chat_id in games:
+        await q.answer("Игра уже идёт. Завершить: /stopgame", show_alert=True)
+        return
+    game = new_game(kind)
+    game["msg_id"] = q.message.message_id
+    games[chat_id] = game
+    await q.answer()
+    await q.edit_message_text(render(game), parse_mode=ParseMode.HTML, reply_markup=keyboard(game))
 
 
 async def cmd_bingo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bingo во время игры — заявка на победу (как слово «бинго»). Запуск игр — через /games."""
     chat = update.effective_chat
     if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
         await update.effective_message.reply_text("Эта команда работает только в группе.")
@@ -908,10 +1020,8 @@ async def cmd_bingo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if game and game["type"] == "bingo":
         await bingo_claim(update, context, game)  # игрок написал /bingo вместо «бинго»
         return
-    if not await is_admin(update, context):
-        await update.effective_message.reply_text("Команда только для админов.")
-        return
-    await start_game(update, "bingo")
+    if await is_admin(update, context):
+        await update.effective_message.reply_text("Игры запускаются командой /games.")
 
 
 @admin_only
@@ -1690,6 +1800,7 @@ async def on_moderation(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     bot = context.bot
     await track_user(user)  # ник -> ID для /ban @юзер; привязка к долгам и чёрному списку
+    await check_name_change(bot, chat.id, user, msg.message_thread_id if msg.is_topic_message else None)
     text = msg.text or msg.caption or ""
     if text.startswith("/"):
         return
@@ -2027,6 +2138,29 @@ async def cmd_protect(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+@admin_only
+async def cmd_who(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/who @юзер — кто это: ID, текущий ник и прошлые (работает и по старому нику)."""
+    msg = update.effective_message
+    t = resolve_target(update, context)
+    if not t:
+        await msg.reply_text("Использование: /who @юзер (или ID, или ответом на сообщение)\n" + NO_TARGET)
+        return
+    uid, label, _ = t
+    rec = known_names.get(uid)
+    lines = [f"🔎 {label}", f"ID: <code>{uid}</code>"]
+    if rec:
+        lines.append(f"Сейчас: {fmt_user(rec['username'])} · {html.escape(rec['name'])}")
+        if rec["hist"]:
+            lines.append("Раньше (до смены):")
+            lines += [f"• {html.escape(h)}" for h in rec["hist"]]
+        else:
+            lines.append("Смен ника бот не замечал.")
+    else:
+        lines.append("Бот этого человека ещё не видел в чате.")
+    await msg.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
 # ---------- теги
 
 def clean_tag(text: str):
@@ -2277,7 +2411,8 @@ def chat_summary(chat_id: int) -> str:
         f"🔗 Запрет ссылок: {onoff(s('antilink'))} (разрешено людям: {people})\n"
         f"🌙 Ночной режим: {onoff(s('night'))} ({s('night_start')}–{s('night_end')}, {html.escape(str(s('tz')))})\n"
         f"⚠️ Предупреждения: {s('warn_limit')} → мут на {fmt_duration(s('warn_mute_h') * 3600)}\n"
-        f"🔤 Запрещённых слов: {len(stopwords.get(chat_id, []))}"
+        f"🔤 Запрещённых слов: {len(stopwords.get(chat_id, []))}\n"
+        f"🔄 Смена ника: {onoff(s('nickwatch'))}"
     )
 
 
@@ -2292,7 +2427,7 @@ def main_menu(chat_id: int):
          btn(f"🌙 Ночной режим {mark(setting(c, 'night'))}", f"cfg:{c}:nm")],
         [btn("⚠️ Предупреждения", f"cfg:{c}:wm"), btn("🔤 Запрещённые слова", f"cfg:{c}:wd")],
         [btn("🔓 Разрешения", f"cfg:{c}:fr"), btn("👥 Пользователи", f"cfg:{c}:um")],
-        [btn("💬 Другой чат", "cfg:0:chats")],
+        [btn(f"🔄 Смена ника {mark(setting(c, 'nickwatch'))}", f"cfg:{c}:nk"), btn("💬 Другой чат", "cfg:0:chats")],
         [btn("✅ Закрыть", f"cfg:{c}:close"), btn("▶️ Другие", f"cfg:{c}:more")],
     ]
     return text, InlineKeyboardMarkup(rows)
@@ -2446,6 +2581,7 @@ def commands_menu(chat_id: int):
         "⚠️ /warn, /unwarn, /warns @юзер\n"
         "🔤 /addword, /delword, /words\n"
         "🏷 /tag, /untag, /admintag, /unadmintag\n"
+        "🔎 /who @юзер — кто это: ID и прошлые ники\n"
         "⚙️ /settings — это меню\n\n"
         "@юзер работает, если бот уже видел сообщения человека; иначе ответьте командой на его сообщение или укажите ID."
     )
@@ -2536,7 +2672,9 @@ async def on_cfg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     note = None
     view = main_menu
-    if action == "lk":
+    if action == "nk":
+        await storage_set_setting(chat_id, "nickwatch", not setting(chat_id, "nickwatch"))
+    elif action == "lk":
         view = links_menu
     elif action == "al":
         await storage_set_setting(chat_id, "antilink", not setting(chat_id, "antilink"))
@@ -3034,7 +3172,7 @@ async def main():
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("roulette", cmd_roulette))
+    app.add_handler(CommandHandler("games", cmd_games))
     app.add_handler(CommandHandler("bingo", cmd_bingo))
     app.add_handler(CommandHandler("close", cmd_close))
     app.add_handler(CommandHandler("random", cmd_random))
@@ -3070,6 +3208,7 @@ async def main():
     app.add_handler(CommandHandler("delword", cmd_delword))
     app.add_handler(CommandHandler("words", cmd_words))
     app.add_handler(CommandHandler("protect", cmd_protect))
+    app.add_handler(CommandHandler("who", cmd_who))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("untag", cmd_untag))
@@ -3079,6 +3218,7 @@ async def main():
     app.add_handler(CommandHandler("delchat", cmd_delchat))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CallbackQueryHandler(on_join, pattern="^join$"))
+    app.add_handler(CallbackQueryHandler(on_game_choice, pattern="^game:"))
     app.add_handler(CallbackQueryHandler(on_trigger_choice, pattern="^tg:"))
     app.add_handler(CallbackQueryHandler(on_cfg, pattern="^cfg:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, on_private_text))
